@@ -11,6 +11,7 @@ type totalLastValue struct {
 	value          float64
 	timestamp      int64
 	deleteDeadline int64
+	ownedKey       string
 }
 
 type totalAggrValueShared struct {
@@ -28,6 +29,9 @@ func (av *totalAggrValue) pushSample(c aggrConfig, sample *pushSample, key strin
 	currentTime := fasttime.UnixTimestamp()
 	keepFirstSample := ac.keepFirstSample && currentTime >= ac.ignoreFirstSampleDeadline
 	lv, ok := av.shared.lastValues[key]
+	if !ok {
+		lv.ownedKey = bytesutil.InternString(key)
+	}
 	if ok || keepFirstSample {
 		if sample.timestamp < lv.timestamp {
 			// Skip out of order sample
@@ -43,8 +47,7 @@ func (av *totalAggrValue) pushSample(c aggrConfig, sample *pushSample, key strin
 	lv.value = sample.value
 	lv.timestamp = sample.timestamp
 	lv.deleteDeadline = deleteDeadline
-	key = bytesutil.InternString(key)
-	av.shared.lastValues[key] = lv
+	av.shared.lastValues[lv.ownedKey] = lv
 }
 
 func (av *totalAggrValue) flush(c aggrConfig, ctx *flushCtx, key string, isLast bool) {
