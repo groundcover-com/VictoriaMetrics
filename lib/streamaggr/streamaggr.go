@@ -1090,6 +1090,9 @@ type pushCtx struct {
 }
 
 func (ctx *pushCtx) reset() {
+	// Drop borrowed keys so pooled samples do not retain superseded label buffers.
+	clear(ctx.blue)
+	clear(ctx.green)
 	ctx.blue = ctx.blue[:0]
 	ctx.green = ctx.green[:0]
 	ctx.labels.Reset()
