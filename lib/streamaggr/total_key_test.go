@@ -1,6 +1,7 @@
 package streamaggr
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestTotalPrometheusLongLabelBufferReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := []byte(strings.Repeat("x", 600))
+	buf := []byte(strings.Repeat("x", 70000))
 	ts := []prompb.TimeSeries{{
 		Labels: []prompb.Label{
 			{Name: "__name__", Value: "counter"},
@@ -47,5 +48,35 @@ func TestTotalPrometheusLongLabelBufferReuse(t *testing.T) {
 	const want = "counter:24h_by_job_total_prometheus{job=\"fixed\"} 20\n"
 	if got != want {
 		t.Fatalf("counter history changed after buffer reuse; got\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestChunkedPush(t *testing.T) {
+	for extra, want := range map[string]string{
+		"":                         "counter:24h_by_job_sum_samples{job=\"fixed\"} 1024\n",
+		"  dedup_interval: 12h\n":  "counter:24h_by_job_sum_samples{job=\"fixed\"} 256\n",
+		"  enable_windows: true\n": "counter:24h_by_job_sum_samples{job=\"fixed\"} 512\n",
+		"  enable_windows: true\n  dedup_interval: 12h\n": "counter:24h_by_job_sum_samples{job=\"fixed\"} 256\n",
+	} {
+		t.Run(strings.TrimSpace(extra), func(t *testing.T) {
+			var output []prompb.TimeSeries
+			a, err := LoadFromData([]byte("- interval: 24h\n  by: [job]\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n"+extra), func(tss []prompb.TimeSeries) {
+				output = appendClonedTimeseries(output, tss)
+			}, &Options{NoAlignFlushToInterval: true}, "chunked_push")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tss := make([]prompb.TimeSeries, 256)
+			for i := range tss {
+				tss[i].Labels = []prompb.Label{{Name: "__name__", Value: "counter"}, {Name: "job", Value: "fixed"}, {Name: "long", Value: strings.Repeat("x", 600) + strconv.Itoa(i)}}
+				tss[i].Samples = []prompb.Sample{{Value: 1, Timestamp: time.Now().UnixMilli()}, {Value: 1, Timestamp: time.Now().Add(36 * time.Hour).UnixMilli()}}
+			}
+			a.Push(tss, nil)
+			a.Push(tss, nil)
+			a.MustStop()
+			if got := timeSeriessToString(output); got != want {
+				t.Fatalf("chunked outputs changed; got %q; want %q", got, want)
+			}
+		})
 	}
 }
