@@ -54,8 +54,7 @@ var supportedOutputs = []string{
 }
 
 var (
-	// lc contains information about all compressed labels for streaming aggregation
-	lc promutil.LabelsCompressor
+	lc labelsCodec
 
 	_ = metrics.NewGauge(`vm_streamaggr_labels_compressor_size_bytes`, func() float64 {
 		return float64(lc.SizeBytes())
@@ -1009,7 +1008,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 
 		bufLen := len(buf)
 		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels)
-		// key remains valid only by the end of this function and can't be reused after
+		// key remains valid until its chunk is consumed and the buffer is reused.
 		// do not intern key because number of unique keys could be too high
 		key := bytesutil.ToUnsafeString(buf[bufLen:])
 		for _, s := range ts.Samples {
@@ -1041,6 +1040,12 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 				})
 			}
 		}
+		// Preserve whole-batch ordering for shared window histories and deduplication.
+		if !enableWindows && a.da == nil && len(buf) >= 64*1024 {
+			a.pushSamples(ctx, deleteDeadlineMsec)
+			ctx.reset()
+			buf = buf[:0]
+		}
 	}
 	if enableWindows && maxLagMsec > 0 {
 		a.muFlushAfter.Lock()
@@ -1050,7 +1055,10 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
 
 	ctx.buf = buf
+	a.pushSamples(ctx, deleteDeadlineMsec)
+}
 
+func (a *aggregator) pushSamples(ctx *pushCtx, deleteDeadlineMsec int64) {
 	pushSamples := a.aggrOutputs.pushSamples
 	if a.da != nil {
 		pushSamples = a.da.pushSamples
@@ -1091,6 +1099,9 @@ type pushCtx struct {
 }
 
 func (ctx *pushCtx) reset() {
+	// Drop borrowed keys so pooled samples do not retain superseded label buffers.
+	clear(ctx.blue)
+	clear(ctx.green)
 	ctx.blue = ctx.blue[:0]
 	ctx.green = ctx.green[:0]
 	ctx.labels.Reset()
