@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/regexutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -129,25 +130,52 @@ func newQueryFilters(tfss [][]storage.TagFilter) [][]queryFilter {
 	return qfss
 }
 
-// filterStorageNodes returns sns, which may contain series matching tfss according to their -storageNodeLabelIndex,
-// and the number of skipped nodes per group.
-func filterStorageNodes(qt *querytracer.Tracer, sns []*storageNode, tfss [][]storage.TagFilter) ([]*storageNode, map[*storageNodesGroup]int) {
-	if len(tfss) == 0 || !slices.ContainsFunc(sns, func(sn *storageNode) bool { return sn.labelIndex != nil }) {
-		return sns, nil
+// mustParseStorageNodeLabelIndexes returns the parsed labelIndexes per each addr.
+//
+// It returns nil if labelIndexes contains no indexes.
+func mustParseStorageNodeLabelIndexes(addrs, labelIndexes []string) []*storageNodeLabelIndex {
+	if len(labelIndexes) == 0 {
+		return nil
 	}
-	qfss := newQueryFilters(tfss)
-	snsFiltered := make([]*storageNode, 0, len(sns))
-	var skippedPerGroup map[*storageNodesGroup]int
-	for _, sn := range sns {
-		if sn.labelIndex == nil || sn.labelIndex.mayMatch(qfss) {
-			snsFiltered = append(snsFiltered, sn)
+	if len(labelIndexes) != len(addrs) {
+		logger.Fatalf("the number of -storageNodeLabelIndex args must match the number of -storageNode args; got %d vs %d", len(labelIndexes), len(addrs))
+	}
+	var lis []*storageNodeLabelIndex
+	for i, s := range labelIndexes {
+		if s == "" {
 			continue
 		}
-		qt.Printf("skip vmstorage %s, since -storageNodeLabelIndex=%s cannot match the query", sn.connPool.Addr(), sn.labelIndex.s)
-		if skippedPerGroup == nil {
-			skippedPerGroup = make(map[*storageNodesGroup]int)
+		li, err := parseStorageNodeLabelIndex(s)
+		if err != nil {
+			logger.Fatalf("cannot parse -storageNodeLabelIndex=%q for -storageNode=%q: %s", s, addrs[i], err)
 		}
-		skippedPerGroup[sn.group]++
+		if lis == nil {
+			lis = make([]*storageNodeLabelIndex, len(addrs))
+		}
+		lis[i] = li
 	}
-	return snsFiltered, skippedPerGroup
+	return lis
+}
+
+// getStorageNodesForQuery returns storage nodes, which may contain series matching tfss according to -storageNodeLabelIndex.
+func getStorageNodesForQuery(qt *querytracer.Tracer, tfss [][]storage.TagFilter) []*storageNode {
+	snb := getStorageNodesBucket()
+	return filterStorageNodes(qt, snb, tfss)
+}
+
+func filterStorageNodes(qt *querytracer.Tracer, snb *storageNodesBucket, tfss [][]storage.TagFilter) []*storageNode {
+	if len(snb.labelIndexes) == 0 || len(tfss) == 0 {
+		return snb.sns
+	}
+	qfss := newQueryFilters(tfss)
+	sns := make([]*storageNode, 0, len(snb.sns))
+	for i, sn := range snb.sns {
+		li := snb.labelIndexes[i]
+		if li == nil || li.mayMatch(qfss) {
+			sns = append(sns, sn)
+			continue
+		}
+		qt.Printf("skip vmstorage %s, since -storageNodeLabelIndex=%s cannot match the query", sn.connPool.Addr(), li.s)
+	}
+	return sns
 }

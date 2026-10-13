@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -933,8 +932,8 @@ func LabelNames(ctx context.Context, qt *querytracer.Tracer, denyPartialResponse
 	if err != nil {
 		return nil, false, err
 	}
-	sns := getStorageNodes()
-	snr := startStorageNodesRequestFiltered(qt, sns, sq.TagFilterss, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
+	sns := getStorageNodesForQuery(qt, sq.TagFilterss)
+	snr := startStorageNodesRequest(qt, sns, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
 		return execSearchQuery(qt, sq, func(qt *querytracer.Tracer, requestData []byte, _ storage.TenantToken) any {
 			sn.labelNamesRequests.Inc()
 			labelNames, err := sn.getLabelNames(ctx, qt, requestData, maxLabelNames)
@@ -1057,8 +1056,8 @@ func LabelValues(ctx context.Context, qt *querytracer.Tracer, denyPartialRespons
 		labelValues []string
 		err         error
 	}
-	sns := getStorageNodes()
-	snr := startStorageNodesRequestFiltered(qt, sns, sq.TagFilterss, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
+	sns := getStorageNodesForQuery(qt, sq.TagFilterss)
+	snr := startStorageNodesRequest(qt, sns, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
 		return execSearchQuery(qt, sq, func(qt *querytracer.Tracer, requestData []byte, _ storage.TenantToken) any {
 			sn.labelValuesRequests.Inc()
 			labelValues, err := sn.getLabelValues(ctx, qt, labelName, requestData, maxLabelValues)
@@ -1311,8 +1310,8 @@ func TSDBStatus(ctx context.Context, qt *querytracer.Tracer, denyPartialResponse
 	if err != nil {
 		return nil, false, err
 	}
-	sns := getStorageNodes()
-	snr := startStorageNodesRequestFiltered(qt, sns, sq.TagFilterss, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
+	sns := getStorageNodesForQuery(qt, sq.TagFilterss)
+	snr := startStorageNodesRequest(qt, sns, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
 		return execSearchQuery(qt, sq, func(qt *querytracer.Tracer, requestData []byte, _ storage.TenantToken) any {
 			sn.tsdbStatusRequests.Inc()
 			status, err := sn.getTSDBStatus(ctx, qt, requestData, focusLabel, topN)
@@ -1719,7 +1718,7 @@ func ExportBlocks(ctx context.Context, qt *querytracer.Tracer, sq *storage.Searc
 		MinTimestamp: sq.MinTimestamp,
 		MaxTimestamp: sq.MaxTimestamp,
 	}
-	sns := getStorageNodes()
+	sns := getStorageNodesForQuery(qt, sq.TagFilterss)
 	blocksRead := newPerNodeCounter(sns)
 	samples := newPerNodeCounter(sns)
 	processBlock := func(mb *storage.MetricBlock, workerID uint) error {
@@ -1768,8 +1767,8 @@ func SearchMetricNames(ctx context.Context, qt *querytracer.Tracer, denyPartialR
 	if err != nil {
 		return nil, false, err
 	}
-	sns := getStorageNodes()
-	snr := startStorageNodesRequestFiltered(qt, sns, sq.TagFilterss, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
+	sns := getStorageNodesForQuery(qt, sq.TagFilterss)
+	snr := startStorageNodesRequest(qt, sns, denyPartialResponse, func(qt *querytracer.Tracer, _ uint, sn *storageNode) any {
 		return execSearchQuery(qt, sq, func(qt *querytracer.Tracer, requestData []byte, t storage.TenantToken) any {
 			sn.searchMetricNamesRequests.Inc()
 			metricNames, err := sn.processSearchMetricNames(ctx, qt, requestData)
@@ -1872,7 +1871,10 @@ func ProcessSearchQuery(ctx context.Context, qt *querytracer.Tracer, denyPartial
 		MinTimestamp: sq.MinTimestamp,
 		MaxTimestamp: sq.MaxTimestamp,
 	}
-	sns := getStorageNodes()
+	sns := getStorageNodesForQuery(qt, sq.TagFilterss)
+	if len(sns) == 0 {
+		return &Results{tr: tr}, false, nil
+	}
 	tbfw := newTmpBlocksFileWrapper(sns)
 	blocksRead := newPerNodeCounter(sns)
 	samples := newPerNodeCounter(sns)
@@ -1931,7 +1933,7 @@ func ProcessSearchQuery(ctx context.Context, qt *querytracer.Tracer, denyPartial
 // Returns workers count and processBlocks function
 func PrepareProcessRawBlocks(ctx context.Context, qt *querytracer.Tracer, denyPartialResponse bool, sq *storage.SearchQuery,
 ) (int, func(processBlock func(mb []byte, workerID uint) error) (bool, error)) {
-	sns := getStorageNodes()
+	sns := getStorageNodesForQuery(qt, sq.TagFilterss)
 	return len(sns), func(processBlock func(mb []byte, workerID uint) error) (bool, error) {
 		return processBlocksInternal(ctx, qt, sns, denyPartialResponse, sq, processBlock)
 	}
@@ -1997,7 +1999,7 @@ func processBlocksInternal(ctx context.Context, qt *querytracer.Tracer, sns []*s
 		return false, err
 	}
 	// Send the query to all the storage nodes in parallel.
-	snr := startStorageNodesRequestFiltered(qt, sns, sq.TagFilterss, denyPartialResponse, func(qt *querytracer.Tracer, workerID uint, sn *storageNode) any {
+	snr := startStorageNodesRequest(qt, sns, denyPartialResponse, func(qt *querytracer.Tracer, workerID uint, sn *storageNode) any {
 		if err := execSearchQueryRequest(ctx, qt, sq, workerID, sn, f); err != nil {
 			return err
 		}
@@ -2049,9 +2051,6 @@ type storageNodesRequest struct {
 	// query tracers to storageAddresses mapping
 	qts map[*querytracer.Tracer]string
 	sns []*storageNode
-
-	// skippedPerGroup contains the number of nodes per group skipped because of -storageNodeLabelIndex.
-	skippedPerGroup map[*storageNodesGroup]int
 }
 
 type rpcResult struct {
@@ -2063,14 +2062,6 @@ type rpcResult struct {
 func startStorageNodesRequest(qt *querytracer.Tracer, sns []*storageNode, denyPartialResponse bool,
 	f func(qt *querytracer.Tracer, workerID uint, sn *storageNode) any,
 ) *storageNodesRequest {
-	return startStorageNodesRequestFiltered(qt, sns, nil, denyPartialResponse, f)
-}
-
-// startStorageNodesRequestFiltered is like startStorageNodesRequest, but it skips sns that cannot match tfss according to -storageNodeLabelIndex.
-func startStorageNodesRequestFiltered(qt *querytracer.Tracer, sns []*storageNode, tfss [][]storage.TagFilter, denyPartialResponse bool,
-	f func(qt *querytracer.Tracer, workerID uint, sn *storageNode) any,
-) *storageNodesRequest {
-	sns, skippedPerGroup := filterStorageNodes(qt, sns, tfss)
 	resultsCh := make(chan rpcResult, len(sns))
 	qts := make(map[*querytracer.Tracer]string, len(sns))
 	for idx, sn := range sns {
@@ -2097,7 +2088,6 @@ func startStorageNodesRequestFiltered(qt *querytracer.Tracer, sns []*storageNode
 		qt:                  qt,
 		qts:                 qts,
 		sns:                 sns,
-		skippedPerGroup:     skippedPerGroup,
 	}
 }
 
@@ -2145,10 +2135,6 @@ func (snr *storageNodesRequest) collectResults(partialResultsCounter *metrics.Co
 	}
 	groupsCount := sns[0].group.groupsCount
 	resultsCollectedPerGroup := make(map[*storageNodesGroup]int, groupsCount)
-	// Skipped nodes have no matching series, so count them as nodes, which returned empty results.
-	maps.Copy(resultsCollectedPerGroup, snr.skippedPerGroup)
-	// resultsReceived counts only the queried nodes, since a partial response needs data from at least one of them.
-	resultsReceived := 0
 	errsPartialPerGroup := make(map[*storageNodesGroup][]error)
 	groupsPartial := make(map[*storageNodesGroup]struct{})
 	for range sns {
@@ -2212,7 +2198,6 @@ func (snr *storageNodesRequest) collectResults(partialResultsCounter *metrics.Co
 		}
 		snr.finishQueryTracer(result.qt, "")
 		resultsCollectedPerGroup[group]++
-		resultsReceived++
 		if *skipSlowReplicas && len(resultsCollectedPerGroup) > groupsCount-*globalReplicationFactor {
 			groupsWithFullResult := 0
 			for g, n := range resultsCollectedPerGroup {
@@ -2251,7 +2236,7 @@ func (snr *storageNodesRequest) collectResults(partialResultsCounter *metrics.Co
 		}
 		partialErrorsLogger.Warnf("%d out of %d vmstorage nodes at group %q were unavailable during the query; a sample error: %s", len(errsPartial), g.nodesCount, g.name, errsPartial[0])
 	}
-	if snr.denyPartialResponse || resultsReceived == 0 {
+	if snr.denyPartialResponse || len(resultsCollectedPerGroup) == 0 {
 		// The response cannot be returned as partial.
 		// Returns 503 status code, so the caller could retry it if needed.
 		err := &httpserver.ErrorWithStatusCode{
@@ -2312,9 +2297,6 @@ func initStorageNodeGroups(addrs []string) map[string]*storageNodesGroup {
 type storageNode struct {
 	// The group this storageNode belongs to.
 	group *storageNodesGroup
-
-	// labelIndex is an optional -storageNodeLabelIndex for the storageNode.
-	labelIndex *storageNodeLabelIndex
 
 	// Connection pool for the given storageNode.
 	connPool *netutil.ConnPool
@@ -3251,6 +3233,9 @@ func readUint64(bc *handshake.BufferedConn) (uint64, error) {
 type storageNodesBucket struct {
 	ms  *metrics.Set
 	sns []*storageNode
+
+	// labelIndexes contains an optional -storageNodeLabelIndex per each sns item.
+	labelIndexes []*storageNodeLabelIndex
 }
 
 var storageNodes atomic.Pointer[storageNodesBucket]
@@ -3288,9 +3273,7 @@ func initStorageNodes(addrs, labelIndexes []string) *storageNodesBucket {
 	if len(addrs) == 0 {
 		logger.Panicf("BUG: addrs must be non-empty")
 	}
-	if len(labelIndexes) > 0 && len(labelIndexes) != len(addrs) {
-		logger.Fatalf("the number of -storageNodeLabelIndex args must match the number of -storageNode args; got %d vs %d", len(labelIndexes), len(addrs))
-	}
+	parsedLabelIndexes := mustParseStorageNodeLabelIndexes(addrs, labelIndexes)
 
 	groupsMap := initStorageNodeGroups(addrs)
 
@@ -3301,31 +3284,24 @@ func initStorageNodes(addrs, labelIndexes []string) *storageNodesBucket {
 	// for big number of storage nodes.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4364
 	for i, addr := range addrs {
-		var labelIndex *storageNodeLabelIndex
-		if len(labelIndexes) > 0 && labelIndexes[i] != "" {
-			var err error
-			labelIndex, err = parseStorageNodeLabelIndex(labelIndexes[i])
-			if err != nil {
-				logger.Fatalf("cannot parse -storageNodeLabelIndex=%q for -storageNode=%q: %s", labelIndexes[i], addr, err)
-			}
-		}
 		var groupName string
 		groupName, addr = netutil.ParseGroupAddr(addr)
 		group := groupsMap[groupName]
 
 		wg.Go(func() {
-			sns[i] = newStorageNode(ms, group, addr, labelIndex)
+			sns[i] = newStorageNode(ms, group, addr)
 		})
 	}
 	wg.Wait()
 	metrics.RegisterSet(ms)
 	return &storageNodesBucket{
-		sns: sns,
-		ms:  ms,
+		sns:          sns,
+		ms:           ms,
+		labelIndexes: parsedLabelIndexes,
 	}
 }
 
-func newStorageNode(ms *metrics.Set, group *storageNodesGroup, addr string, labelIndex *storageNodeLabelIndex) *storageNode {
+func newStorageNode(ms *metrics.Set, group *storageNodesGroup, addr string) *storageNode {
 	normalizedAddr, err := netutil.NormalizeAddr(addr, 8401)
 	if err != nil {
 		logger.Fatalf("cannot normalize -storageNode=%q: %s", addr, err)
@@ -3336,9 +3312,8 @@ func newStorageNode(ms *metrics.Set, group *storageNodesGroup, addr string, labe
 	connPool := netutil.NewConnPool(ms, "vmselect", addr, handshake.VMSelectClient, 0, *vmstorageDialTimeout, *vmstorageUserTimeout)
 
 	sn := &storageNode{
-		group:      group,
-		labelIndex: labelIndex,
-		connPool:   connPool,
+		group:    group,
+		connPool: connPool,
 
 		concurrentQueries: ms.NewCounter(fmt.Sprintf(`vm_concurrent_queries{name="vmselect", addr=%q}`, addr)),
 

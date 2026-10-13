@@ -1,16 +1,10 @@
 package netstorage
 
 import (
-	"errors"
-	"net/http"
-	"strings"
+	"slices"
 	"testing"
 
-	"github.com/VictoriaMetrics/metrics"
-
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 )
 
 func TestParseStorageNodeLabelIndexFailure(t *testing.T) {
@@ -111,55 +105,40 @@ func TestStorageNodeLabelIndexMayMatch(t *testing.T) {
 	f(`region=us-1^^department=security`, `{region="eu-1" or department="security"}`, true)
 }
 
-func TestStorageNodesRequestFilteredCollectResults(t *testing.T) {
-	snb := initStorageNodes([]string{"vmselect-eu-a", "vmselect-eu-b", "vmselect-us"}, []string{"region=eu-1", "region=eu-1", "region=us-east"})
-	defer mustStopStorageNodes(snb)
-
-	tfss, err := searchutil.ParseMetricSelector(`up{region="eu-1"}`)
-	if err != nil {
-		t.Fatalf("cannot parse query: %s", err)
-	}
-	partialResultsCounter := metrics.NewSet().NewCounter("partial_results_total")
-
-	// vmselect-us is skipped, so the query is sent only to vmselect-eu-a and vmselect-eu-b.
-	f := func(failedNodes []string, isPartialExpected bool, statusCodeExpected int) {
+func TestFilterStorageNodes(t *testing.T) {
+	f := func(labelIndexes []string, query string, addrsExpected []string) {
 		t.Helper()
-		snr := startStorageNodesRequestFiltered(nil, snb.sns, tfss, false, func(_ *querytracer.Tracer, _ uint, sn *storageNode) any {
-			for _, addr := range failedNodes {
-				if strings.HasPrefix(sn.connPool.Addr(), addr+":") {
-					return errors.New("connection refused")
-				}
-			}
-			return nil
-		})
-		isPartial, err := snr.collectResults(partialResultsCounter, func(result any) error {
-			err, _ := result.(error)
-			return err
-		})
-		if isPartial != isPartialExpected {
-			t.Fatalf("unexpected isPartial; got %v; want %v", isPartial, isPartialExpected)
+		snb := initStorageNodes([]string{"host1", "host2", "host3"}, labelIndexes)
+		defer mustStopStorageNodes(snb)
+
+		tfss, err := searchutil.ParseMetricSelector(query)
+		if err != nil {
+			t.Fatalf("cannot parse query %q: %s", query, err)
 		}
-		if statusCodeExpected == 0 {
-			if err != nil {
-				t.Fatalf("unexpected error: %s", err)
-			}
-			return
+		var addrs []string
+		for _, sn := range filterStorageNodes(nil, snb, tfss) {
+			addrs = append(addrs, sn.connPool.Addr())
 		}
-		var esc *httpserver.ErrorWithStatusCode
-		if !errors.As(err, &esc) {
-			t.Fatalf("expecting error with status code %d; got %v", statusCodeExpected, err)
-		}
-		if esc.StatusCode != statusCodeExpected {
-			t.Fatalf("unexpected status code; got %d; want %d", esc.StatusCode, statusCodeExpected)
+		if !slices.Equal(addrs, addrsExpected) {
+			t.Fatalf("unexpected storage nodes for query %s; got %q; want %q", query, addrs, addrsExpected)
 		}
 	}
 
-	// all the queried nodes return responses
-	f(nil, false, 0)
+	all := []string{"host1:8401", "host2:8401", "host3:8401"}
 
-	// a part of queried nodes is unavailable
-	f([]string{"vmselect-eu-a"}, true, 0)
+	// no indexes
+	f(nil, `up{region="eu-1"}`, all)
+	f([]string{"", "", ""}, `up{region="eu-1"}`, all)
 
-	// all the queried nodes are unavailable, so there is no data to return as partial response
-	f([]string{"vmselect-eu-a", "vmselect-eu-b"}, false, http.StatusServiceUnavailable)
+	// nodes without index are always queried
+	f([]string{"region=eu-1", "", "region=us-1"}, `up{region="eu-1"}`, []string{"host1:8401", "host2:8401"})
+
+	// the query has no filters for the indexed label
+	f([]string{"region=eu-1", "region=eu-2", "region=us-1"}, `up`, all)
+
+	// some nodes are skipped
+	f([]string{"region=eu-1", "region=eu-2", "region=us-1"}, `up{region=~"eu-.*"}`, []string{"host1:8401", "host2:8401"})
+
+	// all the nodes are skipped
+	f([]string{"region=eu-1", "region=eu-2", "region=us-1"}, `up{region="ap-1"}`, nil)
 }
