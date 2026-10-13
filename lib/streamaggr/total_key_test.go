@@ -51,7 +51,7 @@ func TestTotalPrometheusLongLabelBufferReuse(t *testing.T) {
 	}
 }
 
-func TestChunkedPush(t *testing.T) {
+func TestLargePush(t *testing.T) {
 	for extra, want := range map[string]string{
 		"":                         "counter:24h_by_job_sum_samples{job=\"fixed\"} 1024\n",
 		"  dedup_interval: 12h\n":  "counter:24h_by_job_sum_samples{job=\"fixed\"} 256\n",

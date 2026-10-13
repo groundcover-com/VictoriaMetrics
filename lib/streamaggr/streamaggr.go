@@ -1040,7 +1040,8 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 				})
 			}
 		}
-		if len(buf) >= 64*1024 {
+		// Preserve whole-batch ordering for shared window histories and deduplication.
+		if !enableWindows && a.da == nil && len(buf) >= 64*1024 {
 			a.pushSamples(ctx, deleteDeadlineMsec)
 			ctx.reset()
 			buf = buf[:0]
