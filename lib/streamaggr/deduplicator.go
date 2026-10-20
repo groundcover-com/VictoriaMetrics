@@ -22,7 +22,14 @@ type Deduplicator struct {
 	enableWindows bool
 	dropLabels    []string
 	interval      time.Duration
-	minDeadline   atomic.Int64
+
+	// prevFlushStartMsec and lastFlushStartMsec are the start times of the last two completed
+	// flushes, or of the oldest Push in flight when they started, if earlier; the state holds
+	// no key compressed before the earlier of them.
+	prevFlushStartMsec atomic.Int64
+	lastFlushStartMsec atomic.Int64
+	pushes             pushesInFlight
+	minDeadline        atomic.Int64
 
 	wg     sync.WaitGroup
 	stopCh chan struct{}
@@ -67,6 +74,8 @@ func NewDeduplicator(pushFunc PushFunc, enableWindows bool, interval time.Durati
 
 	metrics.RegisterSet(ms)
 
+	registerLabelsCompressorUser(d, d.keysGoneBefore)
+
 	d.wg.Go(func() {
 		d.runFlusher(pushFunc)
 	})
@@ -81,6 +90,11 @@ func (d *Deduplicator) MustStop() {
 
 	close(d.stopCh)
 	d.wg.Wait()
+	unregisterLabelsCompressorUser(d)
+}
+
+func (d *Deduplicator) keysGoneBefore() time.Time {
+	return time.UnixMilli(d.prevFlushStartMsec.Load())
 }
 
 // Push pushes tss to d.
@@ -90,6 +104,8 @@ func (d *Deduplicator) Push(tss []prompb.TimeSeries) {
 	buf := ctx.buf
 	cs := d.cs.Load()
 	nowMsec := time.Now().UnixMilli()
+	id := d.pushes.start(nowMsec)
+	defer d.pushes.done(id)
 	minDeadline := d.minDeadline.Load()
 	var maxLagMsec int64
 
@@ -185,6 +201,7 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
 	cs := d.cs.Load().newState()
 	d.minDeadline.Store(cs.maxDeadline)
 	startTime := time.Now()
+	oldestPushMsec := d.pushes.oldestMsec(startTime.UnixMilli())
 	deadlineTime := time.UnixMilli(cs.maxDeadline)
 	d.da.flush(func(samples []pushSample, _ int64, _ bool) {
 		ctx := getDeduplicatorFlushCtx()
@@ -214,6 +231,9 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
 		ctx.samples = dstSamples
 		putDeduplicatorFlushCtx(ctx)
 	}, cs.maxDeadline, cs.isGreen)
+
+	d.prevFlushStartMsec.Store(d.lastFlushStartMsec.Load())
+	d.lastFlushStartMsec.Store(oldestPushMsec)
 
 	duration := time.Since(startTime)
 	d.da.flushDuration.Update(duration.Seconds())
