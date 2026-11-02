@@ -22,14 +22,17 @@ type Deduplicator struct {
 	enableWindows bool
 	dropLabels    []string
 	interval      time.Duration
+	minDeadline   atomic.Int64
 
-	// prevFlushStartMsec and lastFlushStartMsec are the start times of the last two completed
-	// flushes, or of the oldest Push in flight when they started, if earlier; the state holds
-	// no key compressed before the earlier of them.
-	prevFlushStartMsec atomic.Int64
-	lastFlushStartMsec atomic.Int64
+	// keysGoneBeforeMsec is the time before which no key compressed by Push remains in the state.
+	// With enable_windows a sample waits for up to two flushes, so it is the start time of the
+	// flush before last, or of the oldest Push in flight then, if earlier.
+	keysGoneBeforeMsec atomic.Int64
 	pushes             pushesInFlight
-	minDeadline        atomic.Int64
+
+	// lastFlushStartMsec is the start time of the last flush, or of the oldest Push in flight
+	// then, if earlier. It is accessed only by runFlusher.
+	lastFlushStartMsec int64
 
 	wg     sync.WaitGroup
 	stopCh chan struct{}
@@ -74,7 +77,7 @@ func NewDeduplicator(pushFunc PushFunc, enableWindows bool, interval time.Durati
 
 	metrics.RegisterSet(ms)
 
-	registerLabelsCompressorUser(d, d.keysGoneBefore)
+	registerLabelsCompressorUser(d)
 
 	d.wg.Go(func() {
 		d.runFlusher(pushFunc)
@@ -94,7 +97,7 @@ func (d *Deduplicator) MustStop() {
 }
 
 func (d *Deduplicator) keysGoneBefore() time.Time {
-	return time.UnixMilli(d.prevFlushStartMsec.Load())
+	return time.UnixMilli(d.keysGoneBeforeMsec.Load())
 }
 
 // Push pushes tss to d.
@@ -232,8 +235,8 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
 		putDeduplicatorFlushCtx(ctx)
 	}, cs.maxDeadline, cs.isGreen)
 
-	d.prevFlushStartMsec.Store(d.lastFlushStartMsec.Load())
-	d.lastFlushStartMsec.Store(oldestPushMsec)
+	d.keysGoneBeforeMsec.Store(d.lastFlushStartMsec)
+	d.lastFlushStartMsec = oldestPushMsec
 
 	duration := time.Since(startTime)
 	d.da.flushDuration.Update(duration.Seconds())

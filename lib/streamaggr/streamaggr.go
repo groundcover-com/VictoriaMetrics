@@ -424,14 +424,22 @@ type aggregator struct {
 	// dedupInterval is optional deduplication interval for incoming samples
 	dedupInterval time.Duration
 
-	// keysGoneBeforeMsec is the time before which no key compressed by a can remain in its
-	// state, as of the last completed flush. prevDedupStartMsec and lastDedupStartMsec are
-	// the start times of the last two completed dedup flushes, or of the oldest Push in flight
-	// when they started, if earlier.
+	// keysGoneBeforeMsec is the time before which no key compressed by Push remains in the state
+	// after the last flush.
 	keysGoneBeforeMsec atomic.Int64
-	prevDedupStartMsec atomic.Int64
-	lastDedupStartMsec atomic.Int64
 	pushes             pushesInFlight
+
+	// The fields below are accessed only by runFlusher.
+	//
+	// prevDedupStartMsec and lastDedupStartMsec are the start times of the last two dedup flushes,
+	// or of the oldest Push in flight when they started, if earlier. With enable_windows a sample
+	// waits in the dedup state for up to two dedup flushes, so the state holds no key compressed
+	// before prevDedupStartMsec.
+	prevDedupStartMsec int64
+	lastDedupStartMsec int64
+
+	// flushedDedups holds the dedup flushes whose samples may remain in aggrOutputs.
+	flushedDedups []flushedDedup
 
 	// da is set to non-nil if input samples must be de-duplicated
 	da *dedupAggr
@@ -678,8 +686,6 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		ignoredOldSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="too_old",%s}`, metricLabels)),
 	}
 
-	registerLabelsCompressorUser(a, a.keysGoneBefore)
-
 	if dedupInterval > 0 {
 		a.da = newDedupAggr(ms, metricLabels)
 	}
@@ -710,6 +716,8 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		cs.maxDeadline = minTime.Add(a.interval).UnixMilli()
 	}
 	a.cs.Store(cs)
+
+	registerLabelsCompressorUser(a)
 
 	a.wg.Go(func() {
 		a.runFlusher(pushFunc, alignFlushToInterval, skipFlushOnShutdown, ignoreFirstIntervals)
@@ -902,8 +910,11 @@ func (a *aggregator) dedupFlush(dedupTime time.Time, cs *currentState) {
 	deleteDeadline := dedupTime.Add(a.stalenessInterval)
 
 	a.da.flush(a.aggrOutputs.pushSamples, deleteDeadline.UnixMilli(), cs.isGreen)
-	a.prevDedupStartMsec.Store(a.lastDedupStartMsec.Load())
-	a.lastDedupStartMsec.Store(oldestPushMsec)
+	a.flushedDedups = append(a.flushedDedups, flushedDedup{
+		deleteDeadlineMsec: deleteDeadline.UnixMilli(),
+		oldestKeyMsec:      a.prevDedupStartMsec,
+	})
+	a.prevDedupStartMsec, a.lastDedupStartMsec = a.lastDedupStartMsec, oldestPushMsec
 
 	d := time.Since(startTime)
 	a.da.flushDuration.Update(d.Seconds())
@@ -925,7 +936,7 @@ func (a *aggregator) dedupFlush(dedupTime time.Time, cs *currentState) {
 func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentState, isLast bool) {
 	startTime := time.Now()
 	ao := a.aggrOutputs
-	oldestPushMsec := a.pushes.oldestMsec(flushTime.UnixMilli())
+	oldestKeyMsec := a.oldestKeyMsecAfterFlush(flushTime.UnixMilli())
 
 	ctx := getFlushCtx(a, ao, pushFunc, flushTime.UnixMilli(), isLast)
 	if a.dedupInterval <= 0 {
@@ -936,14 +947,7 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 	ctx.flushSeries()
 	putFlushCtx(ctx)
 
-	// flushState dropped every entry not pushed since flushTime-stalenessInterval, except the
-	// keys of the Push calls still in flight when it started.
-	goneBefore := min(flushTime.Add(-a.stalenessInterval).UnixMilli(), oldestPushMsec)
-	if a.dedupInterval > 0 {
-		// The dedup state keeps keys pushed since the start of the dedup flush before last.
-		goneBefore = min(goneBefore, a.prevDedupStartMsec.Load())
-	}
-	a.keysGoneBeforeMsec.Store(goneBefore)
+	a.keysGoneBeforeMsec.Store(oldestKeyMsec)
 
 	d := time.Since(startTime)
 	a.flushDuration.Update(d.Seconds())
@@ -953,6 +957,37 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 			"possible solutions: increase interval; use match filter matching smaller number of series; "+
 			"reduce samples' ingestion rate to stream aggregation", a.interval, d.Seconds())
 	}
+}
+
+// flushedDedup describes the samples a dedup flush passed to aggrOutputs.
+type flushedDedup struct {
+	// deleteDeadlineMsec is the deleteDeadline of the samples.
+	deleteDeadlineMsec int64
+
+	// oldestKeyMsec is the time before which none of their keys was compressed.
+	oldestKeyMsec int64
+}
+
+// oldestKeyMsecAfterFlush returns the time before which no key compressed by Push remains in
+// the state once flushState at flushTimeMsec completes.
+//
+// It must be called before flushState, since the Push calls in flight may store keys after it.
+func (a *aggregator) oldestKeyMsecAfterFlush(flushTimeMsec int64) int64 {
+	if a.dedupInterval <= 0 {
+		// flushState drops the entries not pushed since flushTime-stalenessInterval.
+		return min(flushTimeMsec-a.stalenessInterval.Milliseconds(), a.pushes.oldestMsec(flushTimeMsec))
+	}
+
+	// aggrOutputs receives keys only from dedup flushes, and flushState drops the samples
+	// of the dedup flushes with deleteDeadline before flushTime.
+	a.flushedDedups = slices.DeleteFunc(a.flushedDedups, func(fd flushedDedup) bool {
+		return fd.deleteDeadlineMsec < flushTimeMsec
+	})
+	oldestKeyMsec := a.prevDedupStartMsec
+	for _, fd := range a.flushedDedups {
+		oldestKeyMsec = min(oldestKeyMsec, fd.oldestKeyMsec)
+	}
+	return oldestKeyMsec
 }
 
 var flushConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
@@ -1085,22 +1120,26 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 	}
 }
 
+// labelsCompressorUser holds keys compressed by lc.
+type labelsCompressorUser interface {
+	// keysGoneBefore returns the time before which no key it compressed can still be decompressed.
+	keysGoneBefore() time.Time
+}
+
 var (
 	lcUsersLock sync.Mutex
-	// lcUsers holds, per running aggregator or deduplicator, a func returning the time before
-	// which no key it compressed can still be decompressed.
-	lcUsers = map[any]func() time.Time{}
+	lcUsers     = map[labelsCompressorUser]struct{}{}
 )
 
-func registerLabelsCompressorUser(user any, keysGoneBefore func() time.Time) {
+func registerLabelsCompressorUser(u labelsCompressorUser) {
 	lcUsersLock.Lock()
-	lcUsers[user] = keysGoneBefore
+	lcUsers[u] = struct{}{}
 	lcUsersLock.Unlock()
 }
 
-func unregisterLabelsCompressorUser(user any) {
+func unregisterLabelsCompressorUser(u labelsCompressorUser) {
 	lcUsersLock.Lock()
-	delete(lcUsers, user)
+	delete(lcUsers, u)
 	lcUsersLock.Unlock()
 }
 
@@ -1111,8 +1150,8 @@ func unregisterLabelsCompressorUser(user any) {
 func CleanupLabelsCompressor() int {
 	lcUsersLock.Lock()
 	keysGoneBefore := time.Now()
-	for _, f := range lcUsers {
-		if t := f(); t.Before(keysGoneBefore) {
+	for u := range lcUsers {
+		if t := u.keysGoneBefore(); t.Before(keysGoneBefore) {
 			keysGoneBefore = t
 		}
 	}

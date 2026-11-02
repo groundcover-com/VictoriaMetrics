@@ -3,13 +3,16 @@
 package streamaggr
 
 import (
+	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 )
 
@@ -956,4 +959,238 @@ test_delta 4
   outputs: [sum_samples_total]
   enable_windows: true
 `, "1111")
+}
+
+func TestAggregatorsOutputUnchangedByLabelsCompressorCleanup(t *testing.T) {
+	const config = `
+- match: '{__name__=~".+_total"}'
+  without: [node]
+  interval: 30s
+  outputs: [total_prometheus, increase, rate_sum, count_series]
+- match: '{__name__=~".+_seconds"}'
+  without: [node]
+  interval: 30s
+  outputs: [avg, max, last]
+`
+	run := func(cleanupEvery int) (string, int) {
+		var output string
+		freed := 0
+		synctest.Test(t, func(t *testing.T) {
+			resetLabelsCompressor()
+			var tssOutput []prompb.TimeSeries
+			var mu sync.Mutex
+			a, err := LoadFromData([]byte(config), func(tss []prompb.TimeSeries) {
+				mu.Lock()
+				tssOutput = appendClonedTimeseries(tssOutput, tss)
+				mu.Unlock()
+			}, nil, "cleanup")
+			if err != nil {
+				t.Fatalf("cannot initialize aggregators: %s", err)
+			}
+			// Keep pushes off the flush instants, so their order is deterministic.
+			time.Sleep(time.Second)
+			for step := 0; step < 120; step++ {
+				var tss []prompb.TimeSeries
+				ts := time.Now().UnixMilli()
+				for i := 0; i < 5; i++ {
+					node := prompb.Label{Name: "node", Value: fmt.Sprintf("n%d", i%2)}
+					tss = append(tss,
+						prompb.TimeSeries{Labels: []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "svc", Value: fmt.Sprintf("stable-%d", i)}, node},
+							Samples: []prompb.Sample{{Value: float64(step * (i + 1)), Timestamp: ts}}},
+						prompb.TimeSeries{Labels: []prompb.Label{{Name: "__name__", Value: "latency_seconds"}, {Name: "svc", Value: fmt.Sprintf("stable-%d", i)}, node},
+							Samples: []prompb.Sample{{Value: float64(step%7) / 10, Timestamp: ts}}},
+					)
+				}
+				// A churning resource lives for four steps; one comes back after an hour of absence.
+				for _, id := range []int{step / 4, (step / 4) % 3} {
+					tss = append(tss, prompb.TimeSeries{
+						Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "resource_id", Value: fmt.Sprintf("r-%d", id)}, {Name: "node", Value: "n0"}},
+						Samples: []prompb.Sample{{Value: float64(step), Timestamp: ts}},
+					})
+				}
+				a.Push(tss, nil)
+				if cleanupEvery > 0 && step%cleanupEvery == 0 {
+					freed += CleanupLabelsCompressor()
+				}
+				time.Sleep(10 * time.Second)
+			}
+			a.MustStop()
+			output = timeSeriessToString(tssOutput)
+		})
+		return output, freed
+	}
+
+	want, _ := run(0)
+	if again, _ := run(0); again != want {
+		t.Fatalf("two runs without Cleanup differ; the comparison is not deterministic:\n%s", diffLines(again, want))
+	}
+	// Cleanup on every push, far more often than staleness_interval: it must still free only
+	// labels no aggregator state can reference.
+	got, freed := run(1)
+	if freed == 0 {
+		t.Fatalf("Cleanup freed no labels; the test did not exercise eviction")
+	}
+	if got != want {
+		t.Fatalf("aggregation output changed by Cleanup:\n%s", diffLines(got, want))
+	}
+}
+
+// resetLabelsCompressor empties lc, since the labels a previous test left on standby carry
+// a time from another synctest bubble.
+func resetLabelsCompressor() {
+	lc = promutil.LabelsCompressor{}
+}
+
+func diffLines(got, want string) string {
+	gotLines := map[string]bool{}
+	for _, l := range strings.Split(got, "\n") {
+		gotLines[l] = true
+	}
+	wantLines := map[string]bool{}
+	for _, l := range strings.Split(want, "\n") {
+		wantLines[l] = true
+	}
+	var b strings.Builder
+	for _, l := range strings.Split(want, "\n") {
+		if !gotLines[l] {
+			fmt.Fprintf(&b, "- %s\n", l)
+		}
+	}
+	for _, l := range strings.Split(got, "\n") {
+		if !wantLines[l] {
+			fmt.Fprintf(&b, "+ %s\n", l)
+		}
+	}
+	return b.String()
+}
+
+func TestLabelsCompressorCleanupWaitsForAggregatorFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		resetLabelsCompressor()
+		// An aggregator that has not flushed yet still holds every key it compressed, however
+		// long ago, so no label may be freed until it does.
+		a, err := LoadFromData([]byte(`
+- match: '{__name__="requests_total"}'
+  without: [node]
+  interval: 1h
+  outputs: [total]
+`), func([]prompb.TimeSeries) {}, nil, "slow")
+		if err != nil {
+			t.Fatalf("cannot initialize aggregators: %s", err)
+		}
+		time.Sleep(time.Second)
+		for i := 0; i < 50; i++ {
+			a.Push([]prompb.TimeSeries{{
+				Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "id", Value: fmt.Sprintf("slow-%d", i)}},
+				Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().UnixMilli()}},
+			}}, nil)
+			time.Sleep(time.Minute)
+			if freed := CleanupLabelsCompressor(); freed != 0 {
+				t.Fatalf("Cleanup freed %d labels while an aggregator holding them had not flushed", freed)
+			}
+		}
+		a.MustStop()
+	})
+}
+
+func TestLabelsCompressorCleanupWaitsForPushInFlight(t *testing.T) {
+	// A Push that compressed its keys but has not stored them yet: a flush running meanwhile
+	// does not see them, so no flush may report them gone until the Push completes.
+	waitsForPush := func(t *testing.T, pushes *pushesInFlight, keysGoneBefore func() time.Time) {
+		t.Helper()
+		started := time.Now()
+		id := pushes.start(started.UnixMilli())
+		time.Sleep(10 * time.Minute)
+		if got := keysGoneBefore(); got.After(started) {
+			t.Fatalf("keys reported gone before %s while a Push started at %s is in flight", got, started)
+		}
+		pushes.done(id)
+		time.Sleep(time.Minute)
+		if got := keysGoneBefore(); !got.After(started) {
+			t.Fatalf("keys still reported gone only before %s after the Push completed", got)
+		}
+	}
+	newAggregator := func(t *testing.T, dedupInterval string) *aggregator {
+		a, err := LoadFromData([]byte(`
+- match: '{__name__="requests_total"}'
+  interval: 10s
+  dedup_interval: `+dedupInterval+`
+  outputs: [total]
+`), func([]prompb.TimeSeries) {}, nil, "in_flight")
+		if err != nil {
+			t.Fatalf("cannot initialize aggregators: %s", err)
+		}
+		t.Cleanup(a.MustStop)
+		return a.as[0]
+	}
+	t.Run("aggregator", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			a := newAggregator(t, "0s")
+			time.Sleep(time.Second)
+			waitsForPush(t, &a.pushes, a.keysGoneBefore)
+		})
+	})
+	t.Run("aggregator dedup", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			a := newAggregator(t, "5s")
+			time.Sleep(time.Second)
+			waitsForPush(t, &a.pushes, a.keysGoneBefore)
+		})
+	})
+	t.Run("deduplicator", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			d := NewDeduplicator(func([]prompb.TimeSeries) {}, false, 10*time.Second, nil, "in_flight")
+			defer d.MustStop()
+			time.Sleep(time.Second)
+			waitsForPush(t, &d.pushes, d.keysGoneBefore)
+		})
+	})
+}
+
+func TestLabelsCompressorCleanupKeepsLabelsOfDedupFlushedState(t *testing.T) {
+	f := func(config string, sampleAhead time.Duration) {
+		t.Helper()
+		synctest.Test(t, func(t *testing.T) {
+			resetLabelsCompressor()
+			a, err := LoadFromData([]byte(config), func([]prompb.TimeSeries) {}, nil, "dedup")
+			if err != nil {
+				t.Fatalf("cannot initialize aggregators: %s", err)
+			}
+			defer a.MustStop()
+			// Push after the first dedup flush, so earlier dedup flushes do not mask the keys it holds.
+			time.Sleep(time.Minute + time.Second)
+			a.Push([]prompb.TimeSeries{{
+				Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "id", Value: "gone"}},
+				Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().Add(sampleAhead).UnixMilli()}},
+			}}, nil)
+			freed := 0
+			for range 600 {
+				time.Sleep(time.Second)
+				freed += CleanupLabelsCompressor()
+				// Decompress panics if a label of a key in the state was freed.
+				a.as[0].aggrOutputs.m.Range(func(k, _ any) bool {
+					decompressLabels(nil, k.(string))
+					return true
+				})
+			}
+			if freed == 0 {
+				t.Fatalf("Cleanup freed no labels; the test did not exercise eviction")
+			}
+		})
+	}
+
+	f(`
+- match: '{__name__="requests_total"}'
+  interval: 1m
+  dedup_interval: 1m
+  outputs: [total]
+`, 0)
+	// A sample of the next window waits in the dedup state for two dedup flushes.
+	f(`
+- match: '{__name__="requests_total"}'
+  interval: 1m
+  dedup_interval: 1m
+  enable_windows: true
+  outputs: [total]
+`, time.Minute)
 }

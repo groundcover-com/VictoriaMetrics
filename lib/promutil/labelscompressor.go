@@ -163,7 +163,7 @@ func (lc *LabelsCompressor) insert(label prompb.Label) uint64 {
 
 func labelEntrySizeBytes(label prompb.Label) uint64 {
 	labelSizeBytes := uint64(len(label.Name) + len(label.Value))
-	return labelSizeBytes + uint64(2*(unsafe.Sizeof(label)+unsafe.Sizeof(&label))+unsafe.Sizeof(uint64(0)))
+	return labelSizeBytes + uint64(2*(unsafe.Sizeof(label)+unsafe.Sizeof(&label))+unsafe.Sizeof(any(nil)))
 }
 
 // Cleanup frees the standby labels not referenced since they were moved to standby, then
@@ -188,20 +188,16 @@ func (lc *LabelsCompressor) Cleanup(keysGoneBefore time.Time) int {
 	var freed []uint64
 	for label, idx := range lc.standby {
 		if isReferenced(referenced, idx) {
-			labelCopy, _ := lc.idxToLabel.Load(idx)
-			lc.labelToIdx.Store(labelCopy, idx)
+			lc.labelToIdx.Store(label, idx)
 		} else {
 			freed = append(freed, idx)
 			lc.totalSizeBytes.Add(^(labelEntrySizeBytes(label) - 1))
 			lc.itemsCount.Add(^uint64(0))
 		}
-		delete(lc.standby, label)
 	}
 	lc.idxToLabel.deleteBatch(freed)
 	lc.freeIdxs = append(lc.freeIdxs, freed...)
-	if lc.standby == nil {
-		lc.standby = make(map[prompb.Label]uint64)
-	}
+	lc.standby = make(map[prompb.Label]uint64)
 	lc.mu.Unlock()
 
 	// Move the labels not referenced since the previous Cleanup to standby. The scan runs
@@ -236,6 +232,7 @@ func (lc *LabelsCompressor) Cleanup(keysGoneBefore time.Time) int {
 	// the freeing of these labels waits for the keys compressed until now to be gone.
 	lc.mu.Lock()
 	lc.standbySince = time.Now()
+	referenced = lc.loadReferenced()
 	for i := range referenced {
 		referenced[i].Store(0)
 	}
