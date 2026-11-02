@@ -138,11 +138,11 @@ func TestLabelsCompressorCleanupFreesUnreferencedLabels(t *testing.T) {
 	// Labels compressed during a period are kept by its Cleanup, moved to standby by the next one
 	// and freed by the one after.
 	for i := 1; i <= 2; i++ {
-		if freed := lc.Cleanup(time.Now()); freed != 0 {
+		if freed := lc.Cleanup(time.Now(), time.Now); freed != 0 {
 			t.Fatalf("Cleanup #%d freed %d labels; want 0", i, freed)
 		}
 	}
-	if freed := lc.Cleanup(time.Now()); freed != int(itemsBefore) {
+	if freed := lc.Cleanup(time.Now(), time.Now); freed != int(itemsBefore) {
 		t.Fatalf("third Cleanup freed %d labels; want %d", freed, itemsBefore)
 	}
 	if n := lc.ItemsCount(); n != 0 {
@@ -170,8 +170,8 @@ func TestLabelsCompressorCleanupKeepsKeysOfReferencedLabels(t *testing.T) {
 	var lc LabelsCompressor
 	labels := []prompb.Label{{Name: "job", Value: "api"}, {Name: "instance", Value: "10.0.0.1:9100"}}
 	key := lc.Compress(nil, labels)
-	for i := 0; i < 10; i++ {
-		lc.Cleanup(time.Now())
+	for i := range 10 {
+		lc.Cleanup(time.Now(), time.Now)
 		if got := lc.Compress(nil, labels); !bytes.Equal(got, key) {
 			t.Fatalf("key of a label used every period changed after %d Cleanups", i+1)
 		}
@@ -184,8 +184,8 @@ func TestLabelsCompressorCleanupRestoresIdxOfStandbyLabel(t *testing.T) {
 	key := lc.Compress(nil, labels)
 
 	// Unreferenced for one period: on standby, yet keys referencing it must keep their meaning.
-	lc.Cleanup(time.Now())
-	lc.Cleanup(time.Now())
+	lc.Cleanup(time.Now(), time.Now)
+	lc.Cleanup(time.Now(), time.Now)
 	if got := lc.Compress(nil, labels); !bytes.Equal(got, key) {
 		t.Fatalf("label compressed again after one unreferenced period got a different key")
 	}
@@ -196,7 +196,10 @@ func TestLabelsCompressorCleanupRestoresIdxOfStandbyLabel(t *testing.T) {
 
 func TestLabelsCompressorCleanupConcurrent(t *testing.T) {
 	var lc LabelsCompressor
-	var generation atomic.Int64
+	// The workers hold inUse while they use keys, so no key compressed before keysGoneBefore
+	// can still be decompressed, as Cleanup requires.
+	var inUse sync.RWMutex
+	var generation, freed atomic.Int64
 	stop := make(chan struct{})
 	var cleanups sync.WaitGroup
 	cleanups.Go(func() {
@@ -204,8 +207,11 @@ func TestLabelsCompressorCleanupConcurrent(t *testing.T) {
 			select {
 			case <-stop:
 				return
-			case <-time.After(5 * time.Millisecond):
-				lc.Cleanup(time.Now())
+			default:
+				inUse.Lock()
+				keysGoneBefore := time.Now()
+				inUse.Unlock()
+				freed.Add(int64(lc.Cleanup(keysGoneBefore, time.Now)))
 				generation.Add(1)
 			}
 		}
@@ -213,29 +219,37 @@ func TestLabelsCompressorCleanupConcurrent(t *testing.T) {
 
 	hot := newTestSeries(50, 8)
 	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
+	for g := range 8 {
 		wg.Go(func() {
 			prevKeys := make([][]byte, len(hot))
 			prevGen := make([]int64, len(hot))
-			deadline := time.Now().Add(2 * time.Second)
-			for iter := 0; time.Now().Before(deadline); iter++ {
+			step := func(iter int) bool {
+				inUse.RLock()
+				defer inUse.RUnlock()
+
 				i := iter % len(hot)
 				gen := generation.Load()
 				key := lc.Compress(nil, hot[i])
 				if got := lc.Decompress(nil, key); labelsToString(got) != labelsToString(hot[i]) {
 					t.Errorf("hot labels: got %s; want %s", labelsToString(got), labelsToString(hot[i]))
-					return
+					return false
 				}
 				// A key compressed within the same or the next Cleanup period must be identical.
 				if prevKeys[i] != nil && gen-prevGen[i] <= 1 && !bytes.Equal(prevKeys[i], key) {
 					t.Errorf("key of hot labels changed while in use (generations %d -> %d)", prevGen[i], gen)
-					return
+					return false
 				}
-				prevKeys[i], prevGen[i] = key, generation.Load()
+				prevKeys[i], prevGen[i] = key, gen
 
 				churn := []prompb.Label{{Name: "id", Value: fmt.Sprintf("g%d-%d", g, iter)}, {Name: "job", Value: "churn"}}
 				if got := lc.Decompress(nil, lc.Compress(nil, churn)); labelsToString(got) != labelsToString(churn) {
 					t.Errorf("churn labels: got %s; want %s", labelsToString(got), labelsToString(churn))
+					return false
+				}
+				return true
+			}
+			for iter := range 4_000 {
+				if !step(iter) {
 					return
 				}
 			}
@@ -248,7 +262,7 @@ func TestLabelsCompressorCleanupConcurrent(t *testing.T) {
 	if generation.Load() < 10 {
 		t.Fatalf("only %d Cleanups ran; the test did not exercise eviction", generation.Load())
 	}
-	if n := lc.ItemsCount(); n > 100_000 {
-		t.Fatalf("ItemsCount=%d: churned labels were not freed", n)
+	if freed.Load() == 0 {
+		t.Fatalf("Cleanup freed no labels; the test did not exercise eviction")
 	}
 }

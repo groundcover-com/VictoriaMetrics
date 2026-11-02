@@ -424,17 +424,21 @@ type aggregator struct {
 	// dedupInterval is optional deduplication interval for incoming samples
 	dedupInterval time.Duration
 
-	// keysGoneBeforeMsec is the time before which no key compressed by Push remains in the state
-	// after the last flush.
+	// keysGoneBeforeMsec is the time before which no key in the state was last compressed.
 	keysGoneBeforeMsec atomic.Int64
 	pushes             pushesInFlight
 
 	// The fields below are accessed only by runFlusher.
-	//
+
+	// prevOldestPushMsec is the start of the oldest Push in flight at the previous flush.
+	// With enable_windows, such a Push may store samples in the window that flush has just
+	// flushed, so they stay until the next flush of that window.
+	prevOldestPushMsec int64
+
 	// prevDedupStartMsec and lastDedupStartMsec are the start times of the last two dedup flushes,
 	// or of the oldest Push in flight when they started, if earlier. With enable_windows a sample
-	// waits in the dedup state for up to two dedup flushes, so the state holds no key compressed
-	// before prevDedupStartMsec.
+	// waits in the dedup state for up to two dedup flushes, so the next dedup flush passes on
+	// no key compressed before prevDedupStartMsec.
 	prevDedupStartMsec int64
 	lastDedupStartMsec int64
 
@@ -717,7 +721,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	}
 	a.cs.Store(cs)
 
-	registerLabelsCompressorUser(a)
+	registerLabelsCompressorUser(&a.keysGoneBeforeMsec)
 
 	a.wg.Go(func() {
 		a.runFlusher(pushFunc, alignFlushToInterval, skipFlushOnShutdown, ignoreFirstIntervals)
@@ -906,7 +910,7 @@ func (a *aggregator) dedupFlush(dedupTime time.Time, cs *currentState) {
 
 	a.minDeadline.Store(cs.maxDeadline)
 	startTime := time.Now()
-	oldestPushMsec := a.pushes.oldestMsec(startTime.UnixMilli())
+	oldestPushMsec := a.pushes.oldestMsec()
 	deleteDeadline := dedupTime.Add(a.stalenessInterval)
 
 	a.da.flush(a.aggrOutputs.pushSamples, deleteDeadline.UnixMilli(), cs.isGreen)
@@ -936,7 +940,8 @@ func (a *aggregator) dedupFlush(dedupTime time.Time, cs *currentState) {
 func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentState, isLast bool) {
 	startTime := time.Now()
 	ao := a.aggrOutputs
-	oldestKeyMsec := a.oldestKeyMsecAfterFlush(flushTime.UnixMilli())
+	// Push calls in flight may store their keys after flushState, so take their start before it.
+	oldestPushMsec := a.pushes.oldestMsec()
 
 	ctx := getFlushCtx(a, ao, pushFunc, flushTime.UnixMilli(), isLast)
 	if a.dedupInterval <= 0 {
@@ -947,7 +952,23 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 	ctx.flushSeries()
 	putFlushCtx(ctx)
 
-	a.keysGoneBeforeMsec.Store(oldestKeyMsec)
+	var keysGoneBeforeMsec int64
+	if a.dedupInterval > 0 {
+		// aggrOutputs receives keys only from dedup flushes, and flushState dropped the samples of those
+		// with deleteDeadline before flushTime. The first one left holds the oldest keys, and the last one
+		// also bounds the keys still in the dedup state.
+		a.flushedDedups = slices.DeleteFunc(a.flushedDedups, func(fd flushedDedup) bool {
+			return fd.deleteDeadlineMsec < flushTime.UnixMilli()
+		})
+		if len(a.flushedDedups) > 0 {
+			keysGoneBeforeMsec = a.flushedDedups[0].oldestKeyMsec
+		}
+	} else {
+		// flushState dropped the entries not pushed since flushTime-stalenessInterval.
+		keysGoneBeforeMsec = min(flushTime.UnixMilli()-a.stalenessInterval.Milliseconds(), oldestPushMsec, a.prevOldestPushMsec)
+	}
+	a.keysGoneBeforeMsec.Store(keysGoneBeforeMsec)
+	a.prevOldestPushMsec = oldestPushMsec
 
 	d := time.Since(startTime)
 	a.flushDuration.Update(d.Seconds())
@@ -957,6 +978,8 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 			"possible solutions: increase interval; use match filter matching smaller number of series; "+
 			"reduce samples' ingestion rate to stream aggregation", a.interval, d.Seconds())
 	}
+
+	cleanupLabelsCompressorIfDue()
 }
 
 // flushedDedup describes the samples a dedup flush passed to aggrOutputs.
@@ -968,33 +991,7 @@ type flushedDedup struct {
 	oldestKeyMsec int64
 }
 
-// oldestKeyMsecAfterFlush returns the time before which no key compressed by Push remains in
-// the state once flushState at flushTimeMsec completes.
-//
-// It must be called before flushState, since the Push calls in flight may store keys after it.
-func (a *aggregator) oldestKeyMsecAfterFlush(flushTimeMsec int64) int64 {
-	if a.dedupInterval <= 0 {
-		// flushState drops the entries not pushed since flushTime-stalenessInterval.
-		return min(flushTimeMsec-a.stalenessInterval.Milliseconds(), a.pushes.oldestMsec(flushTimeMsec))
-	}
-
-	// aggrOutputs receives keys only from dedup flushes, and flushState drops the samples
-	// of the dedup flushes with deleteDeadline before flushTime.
-	a.flushedDedups = slices.DeleteFunc(a.flushedDedups, func(fd flushedDedup) bool {
-		return fd.deleteDeadlineMsec < flushTimeMsec
-	})
-	oldestKeyMsec := a.prevDedupStartMsec
-	for _, fd := range a.flushedDedups {
-		oldestKeyMsec = min(oldestKeyMsec, fd.oldestKeyMsec)
-	}
-	return oldestKeyMsec
-}
-
 var flushConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
-
-func (a *aggregator) keysGoneBefore() time.Time {
-	return time.UnixMilli(a.keysGoneBeforeMsec.Load())
-}
 
 // MustStop stops the aggregator.
 //
@@ -1002,7 +999,7 @@ func (a *aggregator) keysGoneBefore() time.Time {
 func (a *aggregator) MustStop() {
 	close(a.stopCh)
 	a.wg.Wait()
-	unregisterLabelsCompressorUser(a)
+	unregisterLabelsCompressorUser(&a.keysGoneBeforeMsec)
 }
 
 // Push pushes tss to a.
@@ -1014,10 +1011,9 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 	labels := &ctx.labels
 	inputLabels := &ctx.inputLabels
 	outputLabels := &ctx.outputLabels
-	now := time.Now()
+	now, inFlight := a.pushes.start(ctx.shard)
+	defer a.pushes.done(inFlight)
 	nowMsec := now.UnixMilli()
-	id := a.pushes.start(nowMsec)
-	defer a.pushes.done(id)
 	deleteDeadline := now.Add(a.stalenessInterval)
 	deleteDeadlineMsec := deleteDeadline.UnixMilli()
 
@@ -1120,80 +1116,6 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 	}
 }
 
-// labelsCompressorUser holds keys compressed by lc.
-type labelsCompressorUser interface {
-	// keysGoneBefore returns the time before which no key it compressed can still be decompressed.
-	keysGoneBefore() time.Time
-}
-
-var (
-	lcUsersLock sync.Mutex
-	lcUsers     = map[labelsCompressorUser]struct{}{}
-)
-
-func registerLabelsCompressorUser(u labelsCompressorUser) {
-	lcUsersLock.Lock()
-	lcUsers[u] = struct{}{}
-	lcUsersLock.Unlock()
-}
-
-func unregisterLabelsCompressorUser(u labelsCompressorUser) {
-	lcUsersLock.Lock()
-	delete(lcUsers, u)
-	lcUsersLock.Unlock()
-}
-
-// CleanupLabelsCompressor frees the labels that no running aggregator or deduplicator can
-// still reference. It is safe to call at any rate: a label is freed only after every
-// aggregator and deduplicator completed a flush that dropped all the state compressed
-// before the label was moved to standby.
-func CleanupLabelsCompressor() int {
-	lcUsersLock.Lock()
-	keysGoneBefore := time.Now()
-	for u := range lcUsers {
-		if t := u.keysGoneBefore(); t.Before(keysGoneBefore) {
-			keysGoneBefore = t
-		}
-	}
-	lcUsersLock.Unlock()
-	return lc.Cleanup(keysGoneBefore)
-}
-
-// pushesInFlight tracks the start times of the Push calls in flight: a Push may store keys
-// in the state after a flush that started while it ran.
-type pushesInFlight struct {
-	mu     sync.Mutex
-	nextID uint64
-	starts map[uint64]int64
-}
-
-func (p *pushesInFlight) start(nowMsec int64) uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.starts == nil {
-		p.starts = make(map[uint64]int64)
-	}
-	p.nextID++
-	p.starts[p.nextID] = nowMsec
-	return p.nextID
-}
-
-func (p *pushesInFlight) done(id uint64) {
-	p.mu.Lock()
-	delete(p.starts, id)
-	p.mu.Unlock()
-}
-
-// oldestMsec returns the start of the oldest Push in flight, or msec if none started earlier.
-func (p *pushesInFlight) oldestMsec(msec int64) int64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, start := range p.starts {
-		msec = min(msec, start)
-	}
-	return msec
-}
-
 func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label) []byte {
 	bb := bbPool.Get()
 	bb.B = lc.Compress(bb.B, outputLabels)
@@ -1209,6 +1131,7 @@ func decompressLabels(dst []prompb.Label, key string) []prompb.Label {
 }
 
 type pushCtx struct {
+	shard        uint32
 	green        []pushSample
 	blue         []pushSample
 	labels       promutil.Labels
@@ -1237,7 +1160,9 @@ type pushSample struct {
 func getPushCtx() *pushCtx {
 	v := pushCtxPool.Get()
 	if v == nil {
-		return &pushCtx{}
+		return &pushCtx{
+			shard: pushShards.Add(1),
+		}
 	}
 	return v.(*pushCtx)
 }

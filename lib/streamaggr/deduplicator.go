@@ -24,7 +24,7 @@ type Deduplicator struct {
 	interval      time.Duration
 	minDeadline   atomic.Int64
 
-	// keysGoneBeforeMsec is the time before which no key compressed by Push remains in the state.
+	// keysGoneBeforeMsec is the time before which no key in the state was last compressed.
 	// With enable_windows a sample waits for up to two flushes, so it is the start time of the
 	// flush before last, or of the oldest Push in flight then, if earlier.
 	keysGoneBeforeMsec atomic.Int64
@@ -77,7 +77,7 @@ func NewDeduplicator(pushFunc PushFunc, enableWindows bool, interval time.Durati
 
 	metrics.RegisterSet(ms)
 
-	registerLabelsCompressorUser(d)
+	registerLabelsCompressorUser(&d.keysGoneBeforeMsec)
 
 	d.wg.Go(func() {
 		d.runFlusher(pushFunc)
@@ -93,11 +93,7 @@ func (d *Deduplicator) MustStop() {
 
 	close(d.stopCh)
 	d.wg.Wait()
-	unregisterLabelsCompressorUser(d)
-}
-
-func (d *Deduplicator) keysGoneBefore() time.Time {
-	return time.UnixMilli(d.keysGoneBeforeMsec.Load())
+	unregisterLabelsCompressorUser(&d.keysGoneBeforeMsec)
 }
 
 // Push pushes tss to d.
@@ -106,9 +102,9 @@ func (d *Deduplicator) Push(tss []prompb.TimeSeries) {
 	labels := &ctx.labels
 	buf := ctx.buf
 	cs := d.cs.Load()
-	nowMsec := time.Now().UnixMilli()
-	id := d.pushes.start(nowMsec)
-	defer d.pushes.done(id)
+	now, inFlight := d.pushes.start(ctx.shard)
+	defer d.pushes.done(inFlight)
+	nowMsec := now.UnixMilli()
 	minDeadline := d.minDeadline.Load()
 	var maxLagMsec int64
 
@@ -204,7 +200,7 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
 	cs := d.cs.Load().newState()
 	d.minDeadline.Store(cs.maxDeadline)
 	startTime := time.Now()
-	oldestPushMsec := d.pushes.oldestMsec(startTime.UnixMilli())
+	oldestPushMsec := d.pushes.oldestMsec()
 	deadlineTime := time.UnixMilli(cs.maxDeadline)
 	d.da.flush(func(samples []pushSample, _ int64, _ bool) {
 		ctx := getDeduplicatorFlushCtx()
@@ -254,9 +250,12 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
 		cs.isGreen = !cs.isGreen
 	}
 	d.cs.Store(cs)
+
+	cleanupLabelsCompressorIfDue()
 }
 
 type deduplicatorPushCtx struct {
+	shard  uint32
 	blue   []pushSample
 	green  []pushSample
 	labels promutil.Labels
@@ -273,7 +272,9 @@ func (ctx *deduplicatorPushCtx) reset() {
 func getDeduplicatorPushCtx() *deduplicatorPushCtx {
 	v := deduplicatorPushCtxPool.Get()
 	if v == nil {
-		return &deduplicatorPushCtx{}
+		return &deduplicatorPushCtx{
+			shard: pushShards.Add(1),
+		}
 	}
 	return v.(*deduplicatorPushCtx)
 }
