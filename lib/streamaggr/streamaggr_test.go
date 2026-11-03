@@ -208,6 +208,8 @@ func TestAggregatorsEqual(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cannot initialize aggregators: %s", err)
 		}
+		defer aa.MustStop()
+		defer ab.MustStop()
 		result := aa.Equal(ab)
 		if result != expectedResult {
 			t.Fatalf("unexpected result; got %v; want %v", result, expectedResult)
