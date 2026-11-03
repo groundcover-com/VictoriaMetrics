@@ -24,14 +24,8 @@ type Deduplicator struct {
 	interval      time.Duration
 	minDeadline   atomic.Int64
 
-	// keysGoneBeforeMsec is the time before which no key in the state was last compressed.
-	// With enable_windows a sample waits for up to two flushes, so it is the start time of the
-	// flush before last, or of the oldest Push in flight then, if earlier.
 	keysGoneBeforeMsec atomic.Int64
 	pushes             pushesInFlight
-
-	// lastFlushStartMsec is the start time of the last flush, or of the oldest Push in flight
-	// then, if earlier. It is accessed only by runFlusher.
 	lastFlushStartMsec int64
 
 	wg     sync.WaitGroup
@@ -231,6 +225,7 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
 		putDeduplicatorFlushCtx(ctx)
 	}, cs.maxDeadline, cs.isGreen)
 
+	// With enable_windows a sample may wait for two flushes, so keys from the flush before last may remain.
 	d.keysGoneBeforeMsec.Store(d.lastFlushStartMsec)
 	d.lastFlushStartMsec = oldestPushMsec
 

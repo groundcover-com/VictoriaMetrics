@@ -194,12 +194,15 @@ func TestLabelsCompressorCleanupRestoresIdxOfStandbyLabel(t *testing.T) {
 	}
 }
 
-func TestLabelsCompressorCleanupConcurrent(t *testing.T) {
+func TestLabelsCompressorCleanupKeepsHeldKeys(t *testing.T) {
 	var lc LabelsCompressor
-	// The workers hold inUse while they use keys, so no key compressed before keysGoneBefore
-	// can still be decompressed, as Cleanup requires.
+	const workers = 16
+	// Each worker publishes the oldest compression start of the keys it holds, under inUse, so
+	// keysGoneBefore never passes a key that can still be decompressed.
 	var inUse sync.RWMutex
-	var generation, freed atomic.Int64
+	pinnedStarts := make([]atomic.Int64, workers)
+	flappingStarts := make([]atomic.Int64, workers)
+	var freed atomic.Int64
 	stop := make(chan struct{})
 	var cleanups sync.WaitGroup
 	cleanups.Go(func() {
@@ -208,49 +211,53 @@ func TestLabelsCompressorCleanupConcurrent(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				inUse.Lock()
-				keysGoneBefore := time.Now()
-				inUse.Unlock()
-				freed.Add(int64(lc.Cleanup(keysGoneBefore, time.Now)))
-				generation.Add(1)
 			}
+			inUse.Lock()
+			keysGoneBefore := time.Now().UnixNano()
+			for i := range workers {
+				keysGoneBefore = min(keysGoneBefore, pinnedStarts[i].Load(), flappingStarts[i].Load())
+			}
+			inUse.Unlock()
+			freed.Add(int64(lc.Cleanup(time.Unix(0, keysGoneBefore), time.Now)))
 		}
 	})
 
-	hot := newTestSeries(50, 8)
 	var wg sync.WaitGroup
-	for g := range 8 {
+	for w := range workers {
 		wg.Go(func() {
-			prevKeys := make([][]byte, len(hot))
-			prevGen := make([]int64, len(hot))
-			step := func(iter int) bool {
-				inUse.RLock()
-				defer inUse.RUnlock()
-
-				i := iter % len(hot)
-				gen := generation.Load()
-				key := lc.Compress(nil, hot[i])
-				if got := lc.Decompress(nil, key); labelsToString(got) != labelsToString(hot[i]) {
-					t.Errorf("hot labels: got %s; want %s", labelsToString(got), labelsToString(hot[i]))
-					return false
-				}
-				// A key compressed within the same or the next Cleanup period must be identical.
-				if prevKeys[i] != nil && gen-prevGen[i] <= 1 && !bytes.Equal(prevKeys[i], key) {
-					t.Errorf("key of hot labels changed while in use (generations %d -> %d)", prevGen[i], gen)
-					return false
-				}
-				prevKeys[i], prevGen[i] = key, gen
-
-				churn := []prompb.Label{{Name: "id", Value: fmt.Sprintf("g%d-%d", g, iter)}, {Name: "job", Value: "churn"}}
-				if got := lc.Decompress(nil, lc.Compress(nil, churn)); labelsToString(got) != labelsToString(churn) {
-					t.Errorf("churn labels: got %s; want %s", labelsToString(got), labelsToString(churn))
-					return false
-				}
-				return true
-			}
+			pinned := []prompb.Label{{Name: "pinned", Value: fmt.Sprint(w)}}
+			flapping := []prompb.Label{{Name: "flapping", Value: fmt.Sprint(w)}}
+			var pinnedKey, flappingKey []byte
 			for iter := range 4_000 {
-				if !step(iter) {
+				inUse.RLock()
+				start := time.Now().UnixNano()
+				pinnedStarts[w].Store(start)
+				key := lc.Compress(nil, pinned)
+				if iter%64 == 0 {
+					flappingStarts[w].Store(start)
+					newFlappingKey := lc.Compress(nil, flapping)
+					if flappingKey != nil && !bytes.Equal(newFlappingKey, flappingKey) {
+						t.Errorf("worker %d: key of a held label changed at iteration %d", w, iter)
+					}
+					flappingKey = newFlappingKey
+				}
+				churn := []prompb.Label{{Name: "id", Value: fmt.Sprintf("w%d-%d", w, iter)}}
+				churnKey := lc.Compress(nil, churn)
+				inUse.RUnlock()
+
+				if pinnedKey != nil && !bytes.Equal(key, pinnedKey) {
+					t.Errorf("worker %d: key of a label used every iteration changed at iteration %d", w, iter)
 					return
+				}
+				pinnedKey = key
+				for _, c := range []struct {
+					key    []byte
+					labels []prompb.Label
+				}{{pinnedKey, pinned}, {flappingKey, flapping}, {churnKey, churn}} {
+					if got := lc.Decompress(nil, c.key); labelsToString(got) != labelsToString(c.labels) {
+						t.Errorf("worker %d: decoded %s; want %s", w, labelsToString(got), labelsToString(c.labels))
+						return
+					}
 				}
 			}
 		})
@@ -258,10 +265,6 @@ func TestLabelsCompressorCleanupConcurrent(t *testing.T) {
 	wg.Wait()
 	close(stop)
 	cleanups.Wait()
-
-	if generation.Load() < 10 {
-		t.Fatalf("only %d Cleanups ran; the test did not exercise eviction", generation.Load())
-	}
 	if freed.Load() == 0 {
 		t.Fatalf("Cleanup freed no labels; the test did not exercise eviction")
 	}

@@ -24,23 +24,16 @@ type LabelsCompressor struct {
 	totalSizeBytes atomic.Uint64
 	itemsCount     atomic.Uint64
 
-	// referenced holds a reference bit per idx, set by Compress and cleared when Cleanup visits the idx.
-	// Compress loads it for every label, so it is padded away from the fields written by inserts.
+	// The padding prevents false sharing: Compress loads referenced for every label, while inserts write the fields above.
 	_          [atomicutil.CacheLineSize]byte
 	referenced atomic.Pointer[referencedChunks]
 	_          [atomicutil.CacheLineSize]byte
 
-	// cleanupLock serializes Cleanup calls; mu serializes inserts into labelToIdx with the
-	// parts of Cleanup that change the mapping.
-	cleanupLock sync.Mutex
-	mu          sync.Mutex
-
-	// standby holds the labels moved out of labelToIdx by the last Cleanup, at standbySince.
+	cleanupLock  sync.Mutex
+	mu           sync.Mutex
 	standby      map[prompb.Label]uint64
 	standbySince time.Time
-
-	// freeIdxs holds the idxs of freed labels for reuse.
-	freeIdxs []uint64
+	freeIdxs     []uint64
 }
 
 // SizeBytes returns the size of lc data in bytes
@@ -90,7 +83,8 @@ func (lc *LabelsCompressor) compress(dst []uint64, labels []prompb.Label) {
 	}
 }
 
-// referencedChunks grows by chunks, which are never copied, so no bit is lost while it grows.
+// referencedChunks holds the reference bits in chunks. Growing appends a chunk and never copies one,
+// so no bit is lost while it grows.
 //
 // It is padded, so the slice header loaded by Compress does not share a cache line with other heap objects.
 type referencedChunks struct {
