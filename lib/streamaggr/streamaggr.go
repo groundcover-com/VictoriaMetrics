@@ -252,6 +252,10 @@ type Config struct {
 
 	// EnableWindows enables aggregation in windows
 	EnableWindows *bool `yaml:"enable_windows,omitempty"`
+
+	// WindowFlushDelay sets a fixed flush delay with EnableWindows, preserving output timestamps.
+	// By default, the delay is calculated from accepted sample lag.
+	WindowFlushDelay string `yaml:"window_flush_delay,omitempty"`
 }
 
 // Aggregators aggregates metrics passed to Push and calls pushFunc for aggregated data.
@@ -413,6 +417,7 @@ type aggregator struct {
 	keepMetricNames  bool
 	ignoreOldSamples bool
 	enableWindows    bool
+	windowFlushDelay time.Duration
 
 	by                  []string
 	without             []string
@@ -605,6 +610,25 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	if v := cfg.EnableWindows; v != nil {
 		enableWindows = *v
 	}
+	var windowFlushDelay time.Duration
+	if cfg.WindowFlushDelay != "" {
+		if !enableWindows {
+			return nil, fmt.Errorf("`window_flush_delay` requires `enable_windows: true`")
+		}
+		windowFlushDelay, err = time.ParseDuration(cfg.WindowFlushDelay)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse `window_flush_delay: %q`: %w", cfg.WindowFlushDelay, err)
+		}
+		flushInterval := interval
+		if dedupInterval > 0 {
+			flushInterval = dedupInterval
+		}
+		// Reserve scheduling headroom for flush work before the next tick.
+		maxDelay := flushInterval - flushInterval/10
+		if windowFlushDelay <= 0 || windowFlushDelay > maxDelay {
+			return nil, fmt.Errorf("window_flush_delay=%s must be positive and cannot exceed %s (90%% of flush interval)", windowFlushDelay, maxDelay)
+		}
+	}
 
 	// Initialize common metric labels
 	name := cfg.Name
@@ -661,6 +685,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		keepMetricNames:   keepMetricNames,
 		ignoreOldSamples:  ignoreOldSamples,
 		enableWindows:     enableWindows,
+		windowFlushDelay:  windowFlushDelay,
 		stalenessInterval: stalenessInterval,
 
 		by:                  by,
@@ -837,11 +862,22 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipFlu
 	t := time.NewTicker(interval)
 	defer t.Stop()
 
+flushLoop:
 	for tickerWait(t) {
 		pf := pushFunc
 		if a.enableWindows {
 			delay := time.Duration(a.flushAfterMsec.Swap(0)) * time.Millisecond
-			time.Sleep(delay)
+			if a.windowFlushDelay > 0 {
+				timer := time.NewTimer(a.windowFlushDelay)
+				select {
+				case <-a.stopCh:
+					timer.Stop()
+					break flushLoop
+				case <-timer.C:
+				}
+			} else {
+				time.Sleep(delay)
+			}
 		}
 
 		cs := a.cs.Load().newState()
@@ -1103,14 +1139,18 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []uint32) {
 		pushSamples = a.da.pushSamples
 	}
 
-	if len(ctx.blue) > 0 {
-		a.matchedSamples.Add(len(ctx.blue))
-		pushSamples(ctx.blue, deleteDeadlineMsec, false)
+	// Push the current window first, so outputs with state shared between windows get samples in timestamp order.
+	current, next := ctx.blue, ctx.green
+	if cs.isGreen {
+		current, next = ctx.green, ctx.blue
 	}
-
-	if len(ctx.green) > 0 {
-		a.matchedSamples.Add(len(ctx.green))
-		pushSamples(ctx.green, deleteDeadlineMsec, true)
+	if len(current) > 0 {
+		a.matchedSamples.Add(len(current))
+		pushSamples(current, deleteDeadlineMsec, cs.isGreen)
+	}
+	if len(next) > 0 {
+		a.matchedSamples.Add(len(next))
+		pushSamples(next, deleteDeadlineMsec, !cs.isGreen)
 	}
 }
 

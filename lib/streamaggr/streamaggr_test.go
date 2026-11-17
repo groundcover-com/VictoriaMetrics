@@ -50,6 +50,26 @@ func TestAggregatorsFailure(t *testing.T) {
 - interval: 1foo
   outputs: [total]
 `)
+	for _, delay := range []string{"invalid", "0s", "-1s", "27.001s", "30s"} {
+		f(fmt.Sprintf(`
+- interval: 30s
+  outputs: [total_prometheus]
+  enable_windows: true
+  window_flush_delay: %s
+`, delay))
+	}
+	f(`
+- interval: 30s
+  outputs: [total_prometheus]
+  window_flush_delay: 5s
+`)
+	f(`
+- interval: 30s
+  dedup_interval: 1s
+  outputs: [total_prometheus]
+  enable_windows: true
+  window_flush_delay: 1s
+`)
 
 	// Invalid output
 	f(`

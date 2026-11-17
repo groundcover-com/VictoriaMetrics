@@ -14,11 +14,12 @@ import (
 )
 
 func TestAggregatorsSuccess(t *testing.T) {
-	f := func(inputMetrics []string, interval time.Duration, outputMetricsExpected, config, matchIdxsStrExpected string) {
+	f := func(inputMetrics []string, interval time.Duration, outputMetricsExpected, config, matchIdxsStrExpected string, timestampsExpected ...int64) {
 		t.Helper()
 
 		var matchIdxs []uint32
 		var tssOutput []prompb.TimeSeries
+		var startMsecs int64
 		synctest.Test(t, func(t *testing.T) {
 			var tssOutputLock sync.Mutex
 			// Initialize Aggregators
@@ -31,7 +32,8 @@ func TestAggregatorsSuccess(t *testing.T) {
 			if err != nil {
 				t.Fatalf("cannot initialize aggregators: %s", err)
 			}
-			offsetMsecs := time.Now().UnixMilli()
+			startMsecs = time.Now().UnixMilli()
+			offsetMsecs := startMsecs
 			for _, metrics := range inputMetrics {
 				// Push the inputMetrics to Aggregators
 				tssInput := prometheus.MustParsePromMetrics(metrics, offsetMsecs)
@@ -55,6 +57,16 @@ func TestAggregatorsSuccess(t *testing.T) {
 		outputMetrics := timeSeriessToString(tssOutput)
 		if outputMetrics != outputMetricsExpected {
 			t.Fatalf("unexpected output metrics;\ngot\n%s\nwant\n%s", outputMetrics, outputMetricsExpected)
+		}
+		if len(timestampsExpected) > 0 {
+			if len(tssOutput) != len(timestampsExpected) {
+				t.Fatalf("unexpected output count; got %d; want %d", len(tssOutput), len(timestampsExpected))
+			}
+			for i, ts := range tssOutput {
+				if timestamp := ts.Samples[0].Timestamp - startMsecs; timestamp != timestampsExpected[i] {
+					t.Fatalf("unexpected timestamp for output %d; got %d; want %d", i, timestamp, timestampsExpected[i])
+				}
+			}
 		}
 	}
 
@@ -956,4 +968,60 @@ test_delta 4
   outputs: [sum_samples_total]
   enable_windows: true
 `, "1111")
+
+	// Reproduce issue #11707: samples from both windows in one push must not move the increase into the next window
+	f([]string{`
+foo 0
+`, `
+foo 0 -25
+`, `
+foo 1 -2
+foo 1 1
+`, `
+foo 1 -25
+`, `
+foo 2 -2
+foo 2 1
+`, `
+foo 2 -25
+`, `
+foo 3 -2
+foo 3 1
+`}, 30*time.Second, `foo:1m_increase 1
+foo:1m_increase 1
+foo:1m_increase 1
+foo:1m_total 1
+foo:1m_total 2
+foo:1m_total 3
+`, `
+- interval: 1m
+  outputs: [increase, total]
+  enable_windows: true
+`, "1111111111")
+
+	// A cold window accepts a slow source through the fixed grace while rejecting arrivals after it closes.
+	// Both sources describe observations at 9s; the slow source arrives at 12s, and its 15s replay is too late.
+	f([]string{`
+requests{source="healthy"} 100
+requests{source="slow"} 100
+`, ``, ``, `
+requests{source="healthy"} 110
+`, `
+requests{source="slow"} 120 -3
+`, `
+requests{source="slow"} 999 -6
+`, `
+requests{source="healthy"} 115
+`, ``, ``}, 3*time.Second, `requests 30
+requests 35
+`, `
+- interval: 10s
+  staleness_interval: 30s
+  outputs: [total_prometheus]
+  without: [source]
+  keep_metric_names: true
+  enable_windows: true
+  ignore_old_samples: true
+  window_flush_delay: 5s
+`, "111111", 10000, 20000)
 }
