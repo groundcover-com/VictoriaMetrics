@@ -98,3 +98,35 @@ func TestDeduplicateSamples(t *testing.T) {
 	f(1000, 1000, 1.0, float64(decimal.StaleNaN), 1000, 1.0)
 	f(1000, 1000, float64(decimal.StaleNaN), 2.0, 1000, 2.0)
 }
+
+func TestDedupAggrFlushKeepsKeysVisibleToMarkKeys(t *testing.T) {
+	// A flush takes the samples out of the state before it passes them on.
+	// Until then, markKeys must still see their keys, so the labels compressor keeps their labels.
+	da := newDedupAggr(metrics.NewSet(), "")
+	var samples []pushSample
+	for i := range 1000 {
+		samples = append(samples, pushSample{key: fmt.Sprintf("key-%d", i), value: 1, timestamp: 1})
+	}
+	da.pushSamples(samples, 0, false)
+
+	var mu sync.Mutex
+	flushed := 0
+	da.flush(func(samples []pushSample, _ int64, _ bool) {
+		visible := make(map[string]bool)
+		da.markKeys(func(key string) {
+			visible[key] = true
+		})
+		for _, s := range samples {
+			if !visible[s.key] {
+				t.Errorf("key %q passed on by the flush isn't visible to markKeys", s.key)
+				return
+			}
+		}
+		mu.Lock()
+		flushed += len(samples)
+		mu.Unlock()
+	}, 0, false)
+	if flushed != len(samples) {
+		t.Fatalf("flushed %d samples; want %d", flushed, len(samples))
+	}
+}

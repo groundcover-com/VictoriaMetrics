@@ -3,7 +3,10 @@
 package streamaggr
 
 import (
+	"fmt"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -1026,4 +1029,257 @@ foo:1m_rate_sum 1
   outputs: [rate_sum]
   enable_windows: true
 `, "111111")
+}
+
+func TestAggregatorsOutputUnchangedByLabelsCompressorCleanup(t *testing.T) {
+	f := func(output string) {
+		t.Helper()
+		// The churning resource_id label is in the input key, and the churning pod label is in the output key.
+		config := fmt.Sprintf(`
+- without: [resource_id]
+  interval: 30s
+  staleness_interval: 5m
+  outputs: [%s]
+`, output)
+		run := func(cleanup bool) (string, int) {
+			var result string
+			freed := 0
+			synctest.Test(t, func(t *testing.T) {
+				checkNoLabelsUsers(t)
+				var tssOutput []prompb.TimeSeries
+				var mu sync.Mutex
+				a, err := LoadFromData([]byte(config), func(tss []prompb.TimeSeries) {
+					mu.Lock()
+					tssOutput = appendClonedTimeseries(tssOutput, tss)
+					mu.Unlock()
+				}, nil, "cleanup")
+				if err != nil {
+					t.Fatalf("cannot initialize aggregators: %s", err)
+				}
+				// Push between flushes, so the order is always the same.
+				time.Sleep(time.Second)
+				for step := range 120 {
+					var tss []prompb.TimeSeries
+					ts := time.Now().UnixMilli()
+					for i := range 5 {
+						tss = append(tss, prompb.TimeSeries{
+							Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "svc", Value: fmt.Sprintf("stable-%d", i)}},
+							Samples: []prompb.Sample{{Value: float64(step * (i + 1)), Timestamp: ts}},
+						})
+					}
+					// A resource lives for four steps. The first three also take turns, so each comes back after 80 seconds.
+					// So new labels take the idxs of freed labels while the state of gone resources is not stale yet.
+					for _, id := range []int{step / 4, (step / 4) % 3} {
+						tss = append(tss, prompb.TimeSeries{
+							Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "resource_id", Value: fmt.Sprintf("r-%d", id)}},
+							Samples: []prompb.Sample{{Value: float64(step), Timestamp: ts}},
+						}, prompb.TimeSeries{
+							Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "pod", Value: fmt.Sprintf("p-%d", id)}},
+							Samples: []prompb.Sample{{Value: float64(step), Timestamp: ts}},
+						})
+					}
+					a.Push(tss, nil)
+					if cleanup {
+						freed += cleanupLabels()
+					}
+					time.Sleep(10 * time.Second)
+				}
+				a.MustStop()
+				result = timeSeriessToString(tssOutput)
+			})
+			return result, freed
+		}
+
+		want, _ := run(false)
+		if again, _ := run(false); again != want {
+			t.Fatalf("output %s: two runs without Cleanup differ; the comparison is not deterministic", output)
+		}
+		// Cleanup after every push, much more often than staleness_interval.
+		// It must still free only labels that no aggregator state uses.
+		got, freed := run(true)
+		if freed == 0 {
+			t.Fatalf("output %s: Cleanup freed no labels; the test did not exercise eviction", output)
+		}
+		if got != want {
+			t.Fatalf("output %s changed by Cleanup;\ngot\n%s\nwant\n%s", output, got, want)
+		}
+	}
+
+	// Every output runs alone, so an output that doesn't report its input keys isn't hidden by another one.
+	for _, output := range supportedOutputs {
+		if strings.HasPrefix(output, "quantiles(") {
+			output = "quantiles(0.5)"
+		}
+		f(output)
+	}
+}
+
+func TestLabelsCompressorCleanupKeepsLabelsOfLiveState(t *testing.T) {
+	f := func(config string, sampleAhead time.Duration) {
+		t.Helper()
+		synctest.Test(t, func(t *testing.T) {
+			checkNoLabelsUsers(t)
+			a, err := LoadFromData([]byte(config), func([]prompb.TimeSeries) {}, nil, "dedup")
+			if err != nil {
+				t.Fatalf("cannot initialize aggregators: %s", err)
+			}
+			defer a.MustStop()
+			// Push after the first flush, so older state doesn't hide the keys.
+			// Push again one flush later, so with enable_windows both dedup states hold a key.
+			time.Sleep(time.Minute + time.Second)
+			a.Push([]prompb.TimeSeries{{
+				Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "id", Value: "gone-1"}},
+				Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().Add(sampleAhead).UnixMilli()}},
+			}}, nil)
+			time.Sleep(time.Minute)
+			a.Push([]prompb.TimeSeries{{
+				Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "id", Value: "gone-2"}},
+				Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().Add(sampleAhead).UnixMilli()}},
+			}}, nil)
+			freed := 0
+			for range 600 {
+				time.Sleep(time.Second)
+				freed += cleanupLabels()
+				// No label is pushed from now on, so Decompress panics if a label of a key in the state was freed.
+				checkKeys(a.as[0])
+			}
+			if freed == 0 {
+				t.Fatalf("Cleanup freed no labels; the test did not exercise eviction")
+			}
+		})
+	}
+
+	f(`
+- match: '{__name__="requests_total"}'
+  interval: 1m
+  staleness_interval: 3m
+  outputs: [total]
+`, 0)
+	f(`
+- match: '{__name__="requests_total"}'
+  interval: 1m
+  dedup_interval: 1m
+  outputs: [total]
+`, 0)
+	// A sample of the next window waits in the dedup state for two dedup flushes.
+	f(`
+- match: '{__name__="requests_total"}'
+  interval: 1m
+  dedup_interval: 1m
+  enable_windows: true
+  outputs: [total]
+`, time.Minute)
+	// The id label is in the input part of the keys.
+	f(`
+- match: '{__name__="requests_total"}'
+  without: [id]
+  interval: 1m
+  dedup_interval: 1m
+  enable_windows: true
+  outputs: [total]
+`, time.Minute)
+}
+
+// count_series must keep the labels of the series it counted, even if they are not pushed for longer than a cleanup interval.
+// Otherwise the same series gets a new key and is counted twice.
+func TestCountSeriesUnchangedByLabelsCompressorCleanup(t *testing.T) {
+	f := func(config string, start time.Duration) {
+		t.Helper()
+		run := func(cleanup bool) []float64 {
+			var got []float64
+			synctest.Test(t, func(t *testing.T) {
+				checkNoLabelsUsers(t)
+				var mu sync.Mutex
+				a, err := LoadFromData([]byte(config), func(tss []prompb.TimeSeries) {
+					mu.Lock()
+					for _, ts := range tss {
+						got = append(got, ts.Samples[0].Value)
+					}
+					mu.Unlock()
+				}, nil, "count_series")
+				if err != nil {
+					t.Fatalf("cannot initialize aggregators: %s", err)
+				}
+				push := func() {
+					ts := time.Now().UnixMilli()
+					a.Push([]prompb.TimeSeries{
+						{Labels: []prompb.Label{{Name: "__name__", Value: "up"}, {Name: "instance", Value: "h1"}}, Samples: []prompb.Sample{{Value: 1, Timestamp: ts}}},
+						{Labels: []prompb.Label{{Name: "__name__", Value: "up"}, {Name: "instance", Value: "h2"}}, Samples: []prompb.Sample{{Value: 1, Timestamp: ts}}},
+					}, nil)
+				}
+				time.Sleep(start + time.Second)
+				// Two scrapes in the same interval, two cleanups apart.
+				push()
+				for range 2 {
+					time.Sleep(time.Minute)
+					if cleanup {
+						cleanupLabels()
+					}
+				}
+				// New labels take the freed idxs, so a freed label would come back with another idx.
+				for i := range 100 {
+					lc.Compress(nil, []prompb.Label{{Name: "pod", Value: fmt.Sprintf("new-%d", i)}})
+				}
+				push()
+				time.Sleep(10 * time.Minute)
+				a.MustStop()
+			})
+			slices.Sort(got)
+			return got
+		}
+		want := run(false)
+		if got := run(true); !slices.Equal(got, want) {
+			t.Fatalf("count_series changed by Cleanup: got %v; want %v", got, want)
+		}
+	}
+
+	f(`
+- match: '{__name__="up"}'
+  without: [instance]
+  interval: 5m
+  outputs: [count_series]
+`, 0)
+	// With enable_windows, every other window is counted in a different state.
+	f(`
+- match: '{__name__="up"}'
+  without: [instance]
+  interval: 5m
+  enable_windows: true
+  outputs: [count_series]
+`, 0)
+	f(`
+- match: '{__name__="up"}'
+  without: [instance]
+  interval: 5m
+  enable_windows: true
+  outputs: [count_series]
+`, 5*time.Minute)
+}
+
+func TestLabelsCompressorCleanupKeepsLabelsOfDeduplicatorWindows(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		checkNoLabelsUsers(t)
+		d := NewDeduplicator(func([]prompb.TimeSeries) {}, true, time.Minute, nil, "windows")
+		defer d.MustStop()
+		time.Sleep(time.Minute + time.Second)
+		// A sample of the next window waits for two flushes, which decompress its key.
+		// Push again one flush later, so both dedup states hold a key.
+		d.Push([]prompb.TimeSeries{{
+			Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "id", Value: "gone-1"}},
+			Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().Add(time.Minute).UnixMilli()}},
+		}})
+		time.Sleep(time.Minute)
+		d.Push([]prompb.TimeSeries{{
+			Labels:  []prompb.Label{{Name: "__name__", Value: "requests_total"}, {Name: "id", Value: "gone-2"}},
+			Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().Add(time.Minute).UnixMilli()}},
+		}})
+		freed := 0
+		for range 600 {
+			time.Sleep(time.Second)
+			freed += cleanupLabels()
+		}
+		if freed == 0 {
+			t.Fatalf("Cleanup freed no labels; the test did not exercise eviction")
+		}
+	})
 }

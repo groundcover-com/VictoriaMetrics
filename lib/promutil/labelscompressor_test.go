@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 )
@@ -125,7 +123,9 @@ func newTestSeries(seriesCount, labelsPerSeries int) [][]prompb.Label {
 	return series
 }
 
-func TestLabelsCompressorCleanupFreesUnreferencedLabels(t *testing.T) {
+func noLiveKeys(func([]byte)) {}
+
+func TestLabelsCompressorCleanupFreesUnusedLabels(t *testing.T) {
 	var lc LabelsCompressor
 	for _, labels := range newTestSeries(1000, 10) {
 		lc.Compress(nil, labels)
@@ -135,15 +135,12 @@ func TestLabelsCompressorCleanupFreesUnreferencedLabels(t *testing.T) {
 		t.Fatalf("expected items after compressing")
 	}
 
-	// Labels compressed during a period are kept by its Cleanup, moved to standby by the next one
-	// and freed by the one after.
-	for i := 1; i <= 2; i++ {
-		if freed := lc.Cleanup(time.Now(), time.Now); freed != 0 {
-			t.Fatalf("Cleanup #%d freed %d labels; want 0", i, freed)
-		}
+	// The first Cleanup sees the labels used since the previous one, so it keeps them.
+	if freed := lc.Cleanup(noLiveKeys); freed != 0 {
+		t.Fatalf("first Cleanup freed %d labels; want 0", freed)
 	}
-	if freed := lc.Cleanup(time.Now(), time.Now); freed != int(itemsBefore) {
-		t.Fatalf("third Cleanup freed %d labels; want %d", freed, itemsBefore)
+	if freed := lc.Cleanup(noLiveKeys); freed != int(itemsBefore) {
+		t.Fatalf("second Cleanup freed %d labels; want %d", freed, itemsBefore)
 	}
 	if n := lc.ItemsCount(); n != 0 {
 		t.Fatalf("ItemsCount after freeing everything = %d; want 0", n)
@@ -152,8 +149,8 @@ func TestLabelsCompressorCleanupFreesUnreferencedLabels(t *testing.T) {
 		t.Fatalf("SizeBytes did not shrink: before=%d after=%d", sizeBefore, lc.SizeBytes())
 	}
 
-	// Freed idxs are reused for new labels, which must still round-trip.
-	nextIdxBefore := lc.nextIdx.Load()
+	// New labels reuse the freed idxs and must decode correctly.
+	nextIdxBefore := lc.idxToLabel.nextIdx
 	for _, labels := range newTestSeries(100, 10) {
 		labels = append(labels, prompb.Label{Name: "generation", Value: "2"})
 		got := lc.Decompress(nil, lc.Compress(nil, labels))
@@ -161,111 +158,63 @@ func TestLabelsCompressorCleanupFreesUnreferencedLabels(t *testing.T) {
 			t.Fatalf("unexpected labels after reuse; got %s; want %s", labelsToString(got), labelsToString(labels))
 		}
 	}
-	if lc.nextIdx.Load() != nextIdxBefore {
-		t.Fatalf("new labels allocated fresh idxs (%d -> %d) instead of reusing freed ones", nextIdxBefore, lc.nextIdx.Load())
+	if lc.idxToLabel.nextIdx != nextIdxBefore {
+		t.Fatalf("new labels allocated fresh idxs (%d -> %d) instead of reusing freed ones", nextIdxBefore, lc.idxToLabel.nextIdx)
 	}
 }
 
-func TestLabelsCompressorCleanupKeepsKeysOfReferencedLabels(t *testing.T) {
+func TestLabelsCompressorCleanupKeepsLabelsOfLiveKeys(t *testing.T) {
+	var lc LabelsCompressor
+	labels := []prompb.Label{{Name: "job", Value: "api"}, {Name: "pod", Value: "api-7d9f-x2"}}
+	key := lc.Compress(nil, labels)
+	markKey := func(mark func([]byte)) {
+		mark(key)
+	}
+	for i := range 10 {
+		if freed := lc.Cleanup(markKey); freed != 0 {
+			t.Fatalf("Cleanup #%d freed %d labels of a live key", i+1, freed)
+		}
+	}
+	if got := lc.Decompress(nil, key); labelsToString(got) != labelsToString(labels) {
+		t.Fatalf("unexpected labels; got %s; want %s", labelsToString(got), labelsToString(labels))
+	}
+	// The same labels get the same key while they are kept.
+	if got := lc.Compress(nil, labels); !bytes.Equal(got, key) {
+		t.Fatalf("key of kept labels changed")
+	}
+	// Once the key is gone, the labels are freed.
+	lc.Cleanup(noLiveKeys)
+	if freed := lc.Cleanup(noLiveKeys); freed != len(labels) {
+		t.Fatalf("Cleanup freed %d labels after the key was gone; want %d", freed, len(labels))
+	}
+}
+
+func TestLabelsCompressorCleanupKeepsKeysOfUsedLabels(t *testing.T) {
 	var lc LabelsCompressor
 	labels := []prompb.Label{{Name: "job", Value: "api"}, {Name: "instance", Value: "10.0.0.1:9100"}}
 	key := lc.Compress(nil, labels)
 	for i := range 10 {
-		lc.Cleanup(time.Now(), time.Now)
+		lc.Cleanup(noLiveKeys)
 		if got := lc.Compress(nil, labels); !bytes.Equal(got, key) {
 			t.Fatalf("key of a label used every period changed after %d Cleanups", i+1)
 		}
 	}
 }
 
-func TestLabelsCompressorCleanupRestoresIdxOfStandbyLabel(t *testing.T) {
+func TestLabelsCompressorCompressReinsertsFreedLabel(t *testing.T) {
 	var lc LabelsCompressor
-	labels := []prompb.Label{{Name: "pod", Value: "api-7d9f-x2"}}
+	labels := []prompb.Label{{Name: "job", Value: "api"}}
 	key := lc.Compress(nil, labels)
 
-	// Unreferenced for one period: on standby, yet keys referencing it must keep their meaning.
-	lc.Cleanup(time.Now(), time.Now)
-	lc.Cleanup(time.Now(), time.Now)
-	if got := lc.Compress(nil, labels); !bytes.Equal(got, key) {
-		t.Fatalf("label compressed again after one unreferenced period got a different key")
+	// Cleanup marks an entry freed before it removes it from labelToIdx.
+	// A Compress that finds the entry in between must insert the label again with a new idx.
+	v, _ := lc.labelToIdx.Load(labels[0])
+	v.(*labelEntry).state.Store(labelFreed)
+	newKey := lc.Compress(nil, labels)
+	if bytes.Equal(newKey, key) {
+		t.Fatalf("Compress used the idx of a freed label")
 	}
-	if got := lc.Decompress(nil, key); labelsToString(got) != labelsToString(labels) {
+	if got := lc.Decompress(nil, newKey); labelsToString(got) != labelsToString(labels) {
 		t.Fatalf("unexpected labels; got %s; want %s", labelsToString(got), labelsToString(labels))
-	}
-}
-
-func TestLabelsCompressorCleanupKeepsHeldKeys(t *testing.T) {
-	var lc LabelsCompressor
-	const workers = 16
-	// Each worker publishes the oldest compression start of the keys it holds, under inUse, so
-	// keysGoneBefore never passes a key that can still be decompressed.
-	var inUse sync.RWMutex
-	pinnedStarts := make([]atomic.Int64, workers)
-	flappingStarts := make([]atomic.Int64, workers)
-	var freed atomic.Int64
-	stop := make(chan struct{})
-	var cleanups sync.WaitGroup
-	cleanups.Go(func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			inUse.Lock()
-			keysGoneBefore := time.Now().UnixNano()
-			for i := range workers {
-				keysGoneBefore = min(keysGoneBefore, pinnedStarts[i].Load(), flappingStarts[i].Load())
-			}
-			inUse.Unlock()
-			freed.Add(int64(lc.Cleanup(time.Unix(0, keysGoneBefore), time.Now)))
-		}
-	})
-
-	var wg sync.WaitGroup
-	for w := range workers {
-		wg.Go(func() {
-			pinned := []prompb.Label{{Name: "pinned", Value: fmt.Sprint(w)}}
-			flapping := []prompb.Label{{Name: "flapping", Value: fmt.Sprint(w)}}
-			var pinnedKey, flappingKey []byte
-			for iter := range 4_000 {
-				inUse.RLock()
-				start := time.Now().UnixNano()
-				pinnedStarts[w].Store(start)
-				key := lc.Compress(nil, pinned)
-				if iter%64 == 0 {
-					flappingStarts[w].Store(start)
-					newFlappingKey := lc.Compress(nil, flapping)
-					if flappingKey != nil && !bytes.Equal(newFlappingKey, flappingKey) {
-						t.Errorf("worker %d: key of a held label changed at iteration %d", w, iter)
-					}
-					flappingKey = newFlappingKey
-				}
-				churn := []prompb.Label{{Name: "id", Value: fmt.Sprintf("w%d-%d", w, iter)}}
-				churnKey := lc.Compress(nil, churn)
-				inUse.RUnlock()
-
-				if pinnedKey != nil && !bytes.Equal(key, pinnedKey) {
-					t.Errorf("worker %d: key of a label used every iteration changed at iteration %d", w, iter)
-					return
-				}
-				pinnedKey = key
-				for _, c := range []struct {
-					key    []byte
-					labels []prompb.Label
-				}{{pinnedKey, pinned}, {flappingKey, flapping}, {churnKey, churn}} {
-					if got := lc.Decompress(nil, c.key); labelsToString(got) != labelsToString(c.labels) {
-						t.Errorf("worker %d: decoded %s; want %s", w, labelsToString(got), labelsToString(c.labels))
-						return
-					}
-				}
-			}
-		})
-	}
-	wg.Wait()
-	close(stop)
-	cleanups.Wait()
-	if freed.Load() == 0 {
-		t.Fatalf("Cleanup freed no labels; the test did not exercise eviction")
 	}
 }

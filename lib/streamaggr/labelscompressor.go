@@ -1,156 +1,196 @@
 package streamaggr
 
 import (
-	"flag"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/atomicutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
-var labelsCompressorCleanupInterval = flag.Duration("streamAggr.labelsCompressorCleanupInterval", time.Minute, "The interval for freeing memory "+
-	"occupied by labels of series no longer processed by stream aggregation and deduplication. Zero disables freeing. "+
-	"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/")
+// A background goroutine frees the labels of lc that no aggregator or deduplicator uses,
+// so label churn doesn't grow memory until restart.
+//
+// A label is freed when no stored key has it and Compress didn't use it since the previous cleanup.
+// Every aggregator and deduplicator reports the keys it stores via markLabels.
+// Keys that a Push compressed but didn't store yet are covered by pushesInFlight.
 
+// labelsCleanupInterval is how often the labels that no stored key has are freed.
+const labelsCleanupInterval = 5 * time.Minute
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(labelsCleanupInterval)
+		for range ticker.C {
+			cleanupLabels()
+		}
+	}()
+}
+
+// labelsCleanupLock serializes cleanupLabels calls.
+var labelsCleanupLock sync.Mutex
+
+// cleanupLabels frees the labels of lc that no aggregator or deduplicator uses and returns their number.
+func cleanupLabels() int {
+	labelsCleanupLock.Lock()
+	defer labelsCleanupLock.Unlock()
+
+	if pushesInFlight[(pushesGen.Load()+1)%2].Load() != 0 {
+		// A Push that started before the previous cleanup may still hold keys it didn't store.
+		return 0
+	}
+	freed := lc.Cleanup(func(mark func([]byte)) {
+		labelsUsers.Range(func(u, _ any) bool {
+			u.(labelsUser).markLabels(mark)
+			return true
+		})
+	})
+	pushesGen.Add(1)
+	return freed
+}
+
+// pushesInFlight counts the Push calls in flight in two generations.
+//
+// A Push compresses its keys before it stores them, so markLabels can't see them in between.
+// Compress marks their labels used, so the next cleanup keeps them, but the one after could free them.
+// So every cleanup starts a new generation and runs only when no Push of the previous generation is in flight.
 var (
-	lcUsersLock sync.Mutex
-
-	// lcUsers holds the keysGoneBeforeMsec of every running aggregator and deduplicator:
-	// the time before which no key in its state was last compressed.
-	lcUsers = map[*atomic.Int64]struct{}{}
-
-	lcNextCleanupMsec atomic.Int64
-
-	// lcCleanupWG tracks the cleanups running in the background.
-	lcCleanupWG sync.WaitGroup
-
-	// lcClockMsec is the latest time seen by Push calls and flushes. Labels moved to standby are
-	// stamped no earlier, so a backward step of the system clock cannot free them early.
-	lcClockMsec atomic.Int64
+	pushesGen      atomic.Uint64
+	pushesInFlight [2]atomic.Int64
 )
 
-func registerLabelsCompressorUser(keysGoneBeforeMsec *atomic.Int64) {
-	lcUsersLock.Lock()
-	lcUsers[keysGoneBeforeMsec] = struct{}{}
-	lcUsersLock.Unlock()
+// pushInFlight is a Push counted in pushesInFlight.
+type pushInFlight struct {
+	n *atomic.Int64
 }
 
-func unregisterLabelsCompressorUser(keysGoneBeforeMsec *atomic.Int64) {
-	lcUsersLock.Lock()
-	delete(lcUsers, keysGoneBeforeMsec)
-	lcUsersLock.Unlock()
+// done must be called when the Push stored its keys.
+func (p pushInFlight) done() {
+	p.n.Add(-1)
 }
 
-// cleanupLabelsCompressorIfDue starts cleanupLabelsCompressor at most once per -streamAggr.labelsCompressorCleanupInterval.
-// It runs in the background, so a long cleanup does not delay the flush that started it.
-func cleanupLabelsCompressorIfDue() {
-	interval := *labelsCompressorCleanupInterval
-	if interval <= 0 {
-		return
+// startPush counts a Push in the current generation.
+func startPush() pushInFlight {
+	for {
+		gen := pushesGen.Load()
+		n := &pushesInFlight[gen%2]
+		n.Add(1)
+		if pushesGen.Load() == gen {
+			return pushInFlight{n: n}
+		}
+		// A cleanup started a new generation meanwhile, so count the Push in it.
+		n.Add(-1)
 	}
-	nowMsec := time.Now().UnixMilli()
-	next := lcNextCleanupMsec.Load()
-	if nowMsec < next || !lcNextCleanupMsec.CompareAndSwap(next, nowMsec+interval.Milliseconds()) {
-		return
+}
+
+// labelsUser stores keys compressed with lc.
+type labelsUser interface {
+	// markLabels calls mark for the compressed labels of every key it stores.
+	markLabels(mark func(compressedLabels []byte))
+}
+
+// labelsUsers holds every running aggregator and deduplicator.
+var labelsUsers sync.Map
+
+func (a *aggregator) markLabels(mark func([]byte)) {
+	// A dedup flush moves keys from a.da to a.aggrOutputs, so mark a.da first.
+	if a.da != nil {
+		a.da.markKeys(func(key string) {
+			markKey(mark, key)
+		})
 	}
-	lcCleanupWG.Go(func() {
-		cleanupLabelsCompressor()
+	a.aggrOutputs.markLabels(mark)
+}
+
+func (d *Deduplicator) markLabels(mark func([]byte)) {
+	d.da.markKeys(func(key string) {
+		mark(bytesutil.ToUnsafeBytes(key))
 	})
 }
 
-// cleanupLabelsCompressor frees the labels that no running aggregator or deduplicator can still reference.
-func cleanupLabelsCompressor() int {
-	lcUsersLock.Lock()
-	keysGoneBeforeMsec := time.Now().UnixMilli()
-	for u := range lcUsers {
-		keysGoneBeforeMsec = min(keysGoneBeforeMsec, u.Load())
-	}
-	lcUsersLock.Unlock()
-	return lc.Cleanup(time.UnixMilli(keysGoneBeforeMsec), labelsCompressorNow)
-}
-
-func labelsCompressorNow() time.Time {
-	return time.UnixMilli(max(time.Now().UnixMilli(), lcClockMsec.Load()))
-}
-
-func advanceLabelsCompressorClock(msec int64) {
-	for {
-		clock := lcClockMsec.Load()
-		if msec <= clock || lcClockMsec.CompareAndSwap(clock, msec) {
-			return
+// markKeys calls mark for every key in da, including the keys a flush took but didn't pass on yet.
+func (da *dedupAggr) markKeys(mark func(key string)) {
+	for i := range da.shards {
+		shard := &da.shards[i]
+		for _, state := range []*dedupAggrState{&shard.blue, &shard.green} {
+			state.mu.Lock()
+			for key := range state.m {
+				mark(key)
+			}
+			for key := range state.flushing {
+				mark(key)
+			}
+			state.mu.Unlock()
 		}
 	}
 }
 
-// pushesInFlight bounds the start times of the Push calls in flight without locking: a Push counts
-// itself in the current generation, and the flusher starts a new generation once the previous one
-// has no Push in flight.
-type pushesInFlight struct {
-	gen atomic.Uint64
-
-	// shards spread the per-generation counts of the Push calls in flight over cache lines.
-	shards [64]pushesInFlightShard
-
-	// startMsec holds the start time of each generation. It is accessed only by the flusher.
-	startMsec [2]int64
+// inputKeysHolder is an aggrValue that stores input keys. Every output that stores input keys must implement it.
+type inputKeysHolder interface {
+	markInputKeys(mark func(key string))
 }
 
-type pushesInFlightShard struct {
-	counts [2]atomic.Int64
-
-	// The padding prevents false sharing with the neighboring shards.
-	_ [atomicutil.CacheLineSize - unsafe.Sizeof([2]atomic.Int64{})%atomicutil.CacheLineSize]byte
-}
-
-// pushShards assigns a shard of pushesInFlight to every push context, which sync.Pool keeps on one CPU.
-var pushShards atomic.Uint32
-
-// start registers a Push from shardIdx and returns its start time and the count to pass to done.
-func (p *pushesInFlight) start(shardIdx uint32) (time.Time, *atomic.Int64) {
-	shard := &p.shards[shardIdx%uint32(len(p.shards))]
-	for {
-		gen := p.gen.Load()
-		count := &shard.counts[gen%2]
-		count.Add(1)
-		if p.gen.Load() == gen {
-			now := time.Now()
-			advanceLabelsCompressorClock(now.UnixMilli())
-			return now, count
-		}
-		count.Add(-1)
-	}
-}
-
-func (p *pushesInFlight) done(count *atomic.Int64) {
-	count.Add(-1)
-}
-
-func (p *pushesInFlight) inFlight(gen uint64) bool {
-	for i := range p.shards {
-		if p.shards[i].counts[gen%2].Load() > 0 {
-			return true
+// markLabels calls mark for the labels of every output key and every input key stored in ao.
+func (ao *aggrOutputs) markLabels(mark func([]byte)) {
+	markInputKey := func(key string) {
+		if ao.useInputKey {
+			mark(bytesutil.ToUnsafeBytes(key))
+		} else {
+			markKey(mark, key)
 		}
 	}
-	return false
+	ao.m.Range(func(k, v any) bool {
+		mark(bytesutil.ToUnsafeBytes(k.(string)))
+		av := v.(*aggrValues)
+		av.mu.Lock()
+		for _, outputs := range [][]aggrValue{av.blue, av.green} {
+			for _, o := range outputs {
+				if h, ok := o.(inputKeysHolder); ok {
+					h.markInputKeys(markInputKey)
+				}
+			}
+		}
+		av.mu.Unlock()
+		return true
+	})
 }
 
-// oldestMsec returns a time no later than the start of any Push in flight.
-//
-// It must be called by one goroutine at a time.
-func (p *pushesInFlight) oldestMsec() int64 {
-	nowMsec := time.Now().UnixMilli()
-	advanceLabelsCompressorClock(nowMsec)
-	gen := p.gen.Load()
-	if p.inFlight(gen - 1) {
-		return p.startMsec[(gen-1)%2]
+func (av *totalAggrValue) markInputKeys(mark func(key string)) {
+	for key := range av.shared.lastValues {
+		mark(key)
 	}
-	// No Push of the previous generation is in flight, so start a new generation.
-	p.startMsec[(gen+1)%2] = nowMsec
-	p.gen.Store(gen + 1)
-	if p.inFlight(gen) {
-		return p.startMsec[gen%2]
+}
+
+func (av *increaseAggrValue) markInputKeys(mark func(key string)) {
+	for key := range av.shared {
+		mark(key)
 	}
-	return nowMsec
+}
+
+func (av *rateAggrValue) markInputKeys(mark func(key string)) {
+	for key := range av.shared {
+		mark(key)
+	}
+}
+
+func (av *countSeriesAggrValue) markInputKeys(mark func(key string)) {
+	for src := av.keys; len(src) > 0; {
+		key, n := encoding.UnmarshalBytes(src)
+		mark(bytesutil.ToUnsafeString(key))
+		src = src[n:]
+	}
+}
+
+// markKey calls mark for the output and input labels of a key made by compressLabels.
+func markKey(mark func([]byte), key string) {
+	src := bytesutil.ToUnsafeBytes(key)
+	outputKeyLen, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		logger.Panicf("BUG: cannot unmarshal outputKeyLen from uvarint")
+	}
+	src = src[nSize:]
+	mark(src[:outputKeyLen])
+	mark(src[outputKeyLen:])
 }

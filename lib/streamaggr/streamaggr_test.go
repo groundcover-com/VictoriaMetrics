@@ -2,11 +2,14 @@ package streamaggr
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 )
@@ -205,11 +208,11 @@ func TestAggregatorsEqual(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cannot initialize aggregators: %s", err)
 		}
+		defer aa.MustStop()
 		ab, err := LoadFromData([]byte(b), pushFunc, &opts, "some_alias")
 		if err != nil {
 			t.Fatalf("cannot initialize aggregators: %s", err)
 		}
-		defer aa.MustStop()
 		defer ab.MustStop()
 		result := aa.Equal(ab)
 		if result != expectedResult {
@@ -326,4 +329,158 @@ func TestFlushLag(t *testing.T) {
 	// the delay is capped at 90% of the interval
 	f([]push{{true, 15000, 0}}, 9*time.Second)
 	f([]push{{false, 0, 15000}}, 9*time.Second)
+}
+
+// checkNoLabelsUsers checks that no aggregator or deduplicator of a previous test is still running.
+func checkNoLabelsUsers(t *testing.T) {
+	t.Helper()
+	n := 0
+	labelsUsers.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	if n > 0 {
+		t.Fatalf("%d aggregators or deduplicators of previous tests are still running", n)
+	}
+}
+
+// checkKeys decompresses every key that a holds. Decompress panics if a label of a key was freed.
+func checkKeys(a *aggregator) {
+	// Collect the keys first and decompress them without holding locks, so a panic doesn't hang the test.
+	var keys, labelsKeys []string
+	if a.da != nil {
+		for i := range a.da.shards {
+			shard := &a.da.shards[i]
+			for _, state := range []*dedupAggrState{&shard.blue, &shard.green} {
+				state.mu.Lock()
+				for key := range state.m {
+					keys = append(keys, strings.Clone(key))
+				}
+				state.mu.Unlock()
+			}
+		}
+	}
+	a.aggrOutputs.m.Range(func(k, v any) bool {
+		labelsKeys = append(labelsKeys, strings.Clone(k.(string)))
+		av := v.(*aggrValues)
+		av.mu.Lock()
+		for _, o := range av.blue {
+			if tv, ok := o.(*totalAggrValue); ok {
+				for key := range tv.shared.lastValues {
+					if a.aggrOutputs.useInputKey {
+						labelsKeys = append(labelsKeys, strings.Clone(key))
+					} else {
+						keys = append(keys, strings.Clone(key))
+					}
+				}
+			}
+		}
+		av.mu.Unlock()
+		return true
+	})
+	for _, key := range keys {
+		src := bytesutil.ToUnsafeBytes(key)
+		outputKeyLen, nSize := encoding.UnmarshalVarUint64(src)
+		src = src[nSize:]
+		lc.Decompress(nil, src[:outputKeyLen])
+		lc.Decompress(nil, src[outputKeyLen:])
+	}
+	for _, key := range labelsKeys {
+		decompressLabels(nil, key)
+	}
+}
+
+func TestLabelsCompressorCleanupWaitsForPushInFlight(t *testing.T) {
+	checkNoLabelsUsers(t)
+	labels := []prompb.Label{{Name: "job", Value: "inflight-job"}, {Name: "pod", Value: "inflight-pod"}}
+
+	// A Push that compressed a key but didn't store it yet, for example because it waits for a slow flush.
+	inFlight := startPush()
+	key := lc.Compress(nil, labels)
+	for range 3 {
+		cleanupLabels()
+	}
+	// New labels take the freed idxs, so a freed label would decode to another one.
+	for i := range 100 {
+		lc.Compress(nil, []prompb.Label{{Name: "other", Value: fmt.Sprintf("inflight-%d", i)}})
+	}
+	if got := lc.Decompress(nil, key); !slices.Equal(got, labels) {
+		t.Fatalf("labels of a key compressed by a Push in flight changed; got %s; want %s", got, labels)
+	}
+	inFlight.done()
+
+	// Once the Push is done and no state holds its key, its labels are freed.
+	freed := 0
+	for range 3 {
+		freed += cleanupLabels()
+	}
+	if freed < len(labels) {
+		t.Fatalf("Cleanup freed %d labels after the Push was done; want at least %d", freed, len(labels))
+	}
+}
+
+func TestPushIsCountedUntilItStoresKeys(t *testing.T) {
+	checkNoLabelsUsers(t)
+	inFlight := func() int64 {
+		return pushesInFlight[0].Load() + pushesInFlight[1].Load()
+	}
+	series := []prompb.TimeSeries{{
+		Labels:  []prompb.Label{{Name: "__name__", Value: "counted_total"}, {Name: "job", Value: "j"}},
+		Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().UnixMilli()}},
+	}}
+	// waitBlocked runs push while the state it stores into is locked, and checks that it is counted until it is done.
+	waitBlocked := func(push func(), unlock func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			push()
+			close(done)
+		}()
+		// Wait until the Push is counted. It can't finish while the state is locked.
+		deadline := time.Now().Add(10 * time.Second)
+		for inFlight() != 1 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if n := inFlight(); n != 1 {
+			t.Errorf("got %d Push calls in flight while one waits to store its keys; want 1", n)
+		}
+		unlock()
+		<-done
+		if n := inFlight(); n != 0 {
+			t.Fatalf("got %d Push calls in flight after the Push was done; want 0", n)
+		}
+	}
+
+	a, err := LoadFromData([]byte(`
+- match: '{__name__="counted_total"}'
+  interval: 1h
+  outputs: [total]
+`), func([]prompb.TimeSeries) {}, nil, "counted")
+	if err != nil {
+		t.Fatalf("cannot initialize aggregators: %s", err)
+	}
+	a.Push(series, nil)
+	var av *aggrValues
+	a.as[0].aggrOutputs.m.Range(func(_, v any) bool {
+		av = v.(*aggrValues)
+		return false
+	})
+	av.mu.Lock()
+	waitBlocked(func() { a.Push(series, nil) }, av.mu.Unlock)
+	a.MustStop()
+
+	d := NewDeduplicator(func([]prompb.TimeSeries) {}, false, time.Hour, nil, "counted")
+	var states []*dedupAggrState
+	for i := range d.da.shards {
+		states = append(states, &d.da.shards[i].blue, &d.da.shards[i].green)
+	}
+	for _, s := range states {
+		s.mu.Lock()
+	}
+	waitBlocked(func() { d.Push(series) }, func() {
+		for _, s := range states {
+			s.mu.Unlock()
+		}
+	})
+	d.MustStop()
 }

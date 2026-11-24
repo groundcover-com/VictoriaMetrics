@@ -32,7 +32,11 @@ type dedupAggrShard struct {
 }
 
 type dedupAggrState struct {
-	m          map[string]*dedupAggrSample
+	m map[string]*dedupAggrSample
+
+	// flushing holds the samples a flush took from m until it passes them on, so markKeys sees their keys.
+	flushing map[string]*dedupAggrSample
+
 	mu         sync.Mutex
 	samplesBuf []dedupAggrSample
 	sizeBytes  atomic.Uint64
@@ -249,6 +253,7 @@ func (das *dedupAggrShard) flush(ctx *dedupFlushCtx, f aggrPushFunc) {
 	state.mu.Lock()
 	if len(state.m) > 0 {
 		m = state.m
+		state.flushing = m
 		state.m = make(map[string]*dedupAggrSample, len(state.m))
 		state.samplesBuf = make([]dedupAggrSample, 0, len(state.samplesBuf))
 		state.sizeBytes.Store(0)
@@ -277,4 +282,8 @@ func (das *dedupAggrShard) flush(ctx *dedupFlushCtx, f aggrPushFunc) {
 	}
 	f(dstSamples, ctx.deleteDeadline, false)
 	ctx.samples = dstSamples
+
+	state.mu.Lock()
+	state.flushing = nil
+	state.mu.Unlock()
 }
