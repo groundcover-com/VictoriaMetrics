@@ -2,11 +2,15 @@ package streamaggr
 
 import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/cespare/xxhash/v2"
 )
 
 type countSeriesAggrValue struct {
 	samples map[uint64]struct{}
+
+	// keys holds the counted keys, so the labels compressor keeps their labels until the next flush.
+	keys []byte
 }
 
 func (av *countSeriesAggrValue) pushSample(_ aggrConfig, _ *pushSample, key string, _ int64) {
@@ -15,6 +19,7 @@ func (av *countSeriesAggrValue) pushSample(_ aggrConfig, _ *pushSample, key stri
 	h := xxhash.Sum64(bytesutil.ToUnsafeBytes(key))
 	if _, ok := av.samples[h]; !ok {
 		av.samples[h] = struct{}{}
+		av.keys = encoding.MarshalBytes(av.keys, bytesutil.ToUnsafeBytes(key))
 	}
 }
 
@@ -22,6 +27,7 @@ func (av *countSeriesAggrValue) flush(_ aggrConfig, ctx *flushCtx, key string, _
 	if len(av.samples) > 0 {
 		ctx.appendSeries(key, "count_series", float64(len(av.samples)))
 		clear(av.samples)
+		av.keys = av.keys[:0]
 	}
 }
 
